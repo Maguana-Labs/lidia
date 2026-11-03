@@ -64,16 +64,11 @@ actor VADFilter {
             (\(String(format: "%.0f", (1 - speechDuration / totalDuration) * 100))% silence removed)
             """)
 
-        // Extract and concatenate speech-only regions
-        var filtered: [Float] = []
-        filtered.reserveCapacity(Int(speechDuration * Float(sampleRate)))
-
-        for segment in segments {
-            let startSample = max(0, Int(segment.startTime * Float(sampleRate)))
-            let endSample = min(samples.count, Int(segment.endTime * Float(sampleRate)))
-            guard startSample < endSample else { continue }
-            filtered.append(contentsOf: samples[startSample..<endSample])
-        }
+        let (filtered, _) = Self.extract(
+            samples: samples,
+            sampleRate: sampleRate,
+            ranges: segments.map { (start: TimeInterval($0.startTime), end: TimeInterval($0.endTime)) }
+        )
 
         // Safety: if filtering produced nothing, return original
         if filtered.isEmpty {
@@ -82,5 +77,83 @@ actor VADFilter {
         }
 
         return filtered
+    }
+
+    /// Like `filterSpeech`, but also returns a map from times in the filtered audio back to
+    /// times in the original, so transcripts of the filtered audio keep real timings.
+    /// Without it, removed silence shifts every later word earlier and two separately
+    /// filtered tracks (mic, system) no longer interleave correctly.
+    func filterSpeechKeepingTimeline(samples: [Float], sampleRate: Int) async throws -> (samples: [Float], timeMap: SpeechTimeMap) {
+        try await loadIfNeeded()
+        guard let model else { return (samples, .identity) }
+        let segments = model.detectSpeech(audio: samples, sampleRate: sampleRate)
+        guard !segments.isEmpty else { return (samples, .identity) }
+        let (filtered, map) = Self.extract(
+            samples: samples,
+            sampleRate: sampleRate,
+            ranges: segments.map { (start: TimeInterval($0.startTime), end: TimeInterval($0.endTime)) }
+        )
+        guard !filtered.isEmpty else { return (samples, .identity) }
+        Self.logger.info("VAD pre-filter kept \(String(format: "%.1f", Double(filtered.count) / Double(sampleRate)))s of \(String(format: "%.1f", Double(samples.count) / Double(sampleRate)))s")
+        return (filtered, map)
+    }
+
+    /// Concatenates the given time ranges of `samples` and records where each one came from.
+    static func extract(
+        samples: [Float],
+        sampleRate: Int,
+        ranges: [(start: TimeInterval, end: TimeInterval)]
+    ) -> (samples: [Float], timeMap: SpeechTimeMap) {
+        var filtered: [Float] = []
+        var spans: [SpeechTimeMap.Span] = []
+        for range in ranges.sorted(by: { $0.start < $1.start }) {
+            let startSample = max(0, Int(range.start * Double(sampleRate)))
+            let endSample = min(samples.count, Int(range.end * Double(sampleRate)))
+            guard startSample < endSample else { continue }
+            spans.append(.init(
+                filteredStart: Double(filtered.count) / Double(sampleRate),
+                originalStart: Double(startSample) / Double(sampleRate),
+                duration: Double(endSample - startSample) / Double(sampleRate)
+            ))
+            filtered.append(contentsOf: samples[startSample..<endSample])
+        }
+        return (filtered, SpeechTimeMap(spans: spans))
+    }
+}
+
+/// Maps times in VAD-filtered (silence-removed) audio back to the original recording.
+struct SpeechTimeMap: Sendable, Equatable {
+    struct Span: Sendable, Equatable {
+        var filteredStart: TimeInterval
+        var originalStart: TimeInterval
+        var duration: TimeInterval
+    }
+
+    var spans: [Span]
+
+    static let identity = SpeechTimeMap(spans: [])
+
+    func originalTime(_ filteredTime: TimeInterval) -> TimeInterval {
+        guard !spans.isEmpty else { return filteredTime }
+        // Last span starting at or before this time; times past a span's end (rounding at
+        // the seam) stay attached to that span.
+        var lo = 0
+        var hi = spans.count - 1
+        while lo < hi {
+            let mid = (lo + hi + 1) / 2
+            if spans[mid].filteredStart <= filteredTime { lo = mid } else { hi = mid - 1 }
+        }
+        let span = spans[lo]
+        return span.originalStart + max(0, filteredTime - span.filteredStart)
+    }
+
+    func remap(_ words: [TranscriptWord]) -> [TranscriptWord] {
+        guard !spans.isEmpty else { return words }
+        return words.map { word in
+            var w = word
+            w.start = originalTime(word.start)
+            w.end = max(w.start, originalTime(word.end))
+            return w
+        }
     }
 }

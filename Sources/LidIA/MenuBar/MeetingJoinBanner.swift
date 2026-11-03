@@ -144,14 +144,17 @@ private struct MeetingJoinBannerView: View {
                     .font(.caption2.bold())
                     .foregroundStyle(.secondary)
                     .frame(width: 28, height: 28)
+                    .contentShape(.rect)
             }
             .buttonStyle(.plain)
+            .accessibilityLabel("Dismiss meeting reminder")
+            .help("Dismiss")
 
             // Colored accent bar
             RoundedRectangle(cornerRadius: 2)
                 .fill(
                     LinearGradient(
-                        colors: [.red, .orange],
+                        colors: [Brand.red, Brand.coral],
                         startPoint: .top,
                         endPoint: .bottom
                     )
@@ -182,7 +185,7 @@ private struct MeetingJoinBannerView: View {
                         Text(buttonTitle)
                             .font(.caption.bold())
                         Text(buttonSubtitle)
-                            .font(.system(size: 8))
+                            .font(.caption2)
                             .foregroundStyle(.white.opacity(0.8))
                     }
                 }

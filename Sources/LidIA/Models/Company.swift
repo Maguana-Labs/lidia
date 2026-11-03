@@ -5,7 +5,7 @@ import Foundation
 struct Company: Identifiable, Hashable {
     var id: String { domain }
     let domain: String
-    let name: String  // Derived from domain (e.g., "cloudvisor.eu" -> "Cloudvisor")
+    let name: String  // Derived from domain (e.g., "harborcloud.example" -> "Harborcloud")
     var attendeeEmails: Set<String> = []
     var meetingCount: Int = 0
     var lastMeetingDate: Date?

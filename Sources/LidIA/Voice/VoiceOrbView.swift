@@ -8,12 +8,11 @@ struct VoiceOrbView: View {
     var onClose: (() -> Void)?
     var onMute: (() -> Void)?
 
-    // Brand colors
-    private let magenta = Color(red: 1.0, green: 0.31, blue: 0.64)   // #FF4FA3
-    private let coral = Color(red: 1.0, green: 0.37, blue: 0.48)     // #FF5E7A
-    private let cyan = Color(red: 0.50, green: 0.91, blue: 1.0)      // #7FE7FF
-    private let deepPurple = Color(red: 0.16, green: 0.05, blue: 0.43) // #2A0E6E
-    private let blue = Color(red: 0.06, green: 0.30, blue: 0.81)     // #0F4CCF
+    // Brand colors: the icon's glass, crimson through her red to a coral and ivory highlight.
+    private let red = Color(nsColor: NSColor(hex: Brand.Hex.red))
+    private let coral = Brand.coral
+    private let glow = Color(nsColor: NSColor(hex: Brand.Hex.rose))
+    private let crimson = Brand.crimson
 
     var body: some View {
         VStack(spacing: 12) {
@@ -97,27 +96,27 @@ struct VoiceOrbView: View {
             let breath = sin(time * 2.0) * 0.02 + 1.0
             distortion = 0
             glowRadius = baseRadius * breath
-            gradient = Gradient(colors: [magenta.opacity(0.6), cyan.opacity(0.4)])
+            gradient = Gradient(colors: [red.opacity(0.6), glow.opacity(0.4)])
 
         case .listening:
             distortion = level * 20
             glowRadius = baseRadius * (1.0 + level * 0.3)
             if isMuted {
-                gradient = Gradient(colors: [magenta.opacity(0.3), coral.opacity(0.2), cyan.opacity(0.2)])
+                gradient = Gradient(colors: [red.opacity(0.3), coral.opacity(0.2), glow.opacity(0.2)])
             } else {
-                gradient = Gradient(colors: [magenta, coral, cyan.opacity(0.6)])
+                gradient = Gradient(colors: [red, coral, glow.opacity(0.6)])
             }
 
         case .thinking:
             let rotate = time.truncatingRemainder(dividingBy: 2.0) / 2.0
             distortion = sin(rotate * .pi * 2) * 8
             glowRadius = baseRadius * (0.9 + sin(time * 3) * 0.05)
-            gradient = Gradient(colors: [blue, cyan, magenta.opacity(0.3)])
+            gradient = Gradient(colors: [crimson, glow, red.opacity(0.3)])
 
         case .speaking:
             distortion = level * 15
             glowRadius = baseRadius * (1.0 + level * 0.2)
-            gradient = Gradient(colors: [magenta, coral, cyan])
+            gradient = Gradient(colors: [red, coral, glow])
         }
 
         // Outer glow
@@ -129,7 +128,7 @@ struct VoiceOrbView: View {
         )
         let glowPath = Circle().path(in: glowRect)
         context.fill(glowPath, with: .radialGradient(
-            Gradient(colors: [magenta.opacity(0.3), .clear]),
+            Gradient(colors: [red.opacity(0.3), .clear]),
             center: center,
             startRadius: glowRadius * 0.5,
             endRadius: glowRadius + 20

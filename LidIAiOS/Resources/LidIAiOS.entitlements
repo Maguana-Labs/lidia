@@ -13,5 +13,13 @@
     </array>
     <key>com.apple.developer.ubiquity-kvstore-identifier</key>
     <string>$(TeamIdentifierPrefix)io.lidia.app</string>
+    <!-- First group: where this app writes. Second: the Mac app's group, so keys the
+         Mac shares through iCloud Keychain ("Sync keys via iCloud") can be read here.
+         Both apps must be signed by the same team. -->
+    <key>keychain-access-groups</key>
+    <array>
+        <string>$(AppIdentifierPrefix)io.lidia.ios</string>
+        <string>$(AppIdentifierPrefix)io.lidia.app</string>
+    </array>
 </dict>
 </plist>

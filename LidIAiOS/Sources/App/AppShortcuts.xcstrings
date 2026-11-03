@@ -1,0 +1,166 @@
+{
+  "sourceLanguage": "en",
+  "strings": {
+    "Add a note in ${applicationName}": {
+      "localizations": {
+        "es": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Añade una nota en ${applicationName}"
+          }
+        }
+      }
+    },
+    "Ask ${applicationName}": {
+      "localizations": {
+        "es": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Pregunta a ${applicationName}"
+          }
+        }
+      }
+    },
+    "Ask ${applicationName} about my meetings": {
+      "localizations": {
+        "es": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Pregunta a ${applicationName} sobre mis reuniones"
+          }
+        }
+      }
+    },
+    "Bookmark this moment in ${applicationName}": {
+      "localizations": {
+        "es": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Marca este momento en ${applicationName}"
+          }
+        }
+      }
+    },
+    "Find meetings in ${applicationName}": {
+      "localizations": {
+        "es": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Busca reuniones en ${applicationName}"
+          }
+        }
+      }
+    },
+    "Get meeting notes from ${applicationName}": {
+      "localizations": {
+        "es": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Dame las notas de la reunión de ${applicationName}"
+          }
+        }
+      }
+    },
+    "Mark this moment in ${applicationName}": {
+      "localizations": {
+        "es": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Guarda este momento en ${applicationName}"
+          }
+        }
+      }
+    },
+    "Record a meeting with ${applicationName}": {
+      "localizations": {
+        "es": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Graba una reunión con ${applicationName}"
+          }
+        }
+      }
+    },
+    "Search my ${applicationName} meetings": {
+      "localizations": {
+        "es": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Busca en mis reuniones de ${applicationName}"
+          }
+        }
+      }
+    },
+    "Show my action items in ${applicationName}": {
+      "localizations": {
+        "es": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Muestra mis tareas en ${applicationName}"
+          }
+        }
+      }
+    },
+    "Start ${applicationName}": {
+      "localizations": {
+        "es": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Abre ${applicationName} para grabar"
+          }
+        }
+      }
+    },
+    "Stop recording in ${applicationName}": {
+      "localizations": {
+        "es": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Deja de grabar en ${applicationName}"
+          }
+        }
+      }
+    },
+    "Stop the ${applicationName} recording": {
+      "localizations": {
+        "es": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Para la grabación de ${applicationName}"
+          }
+        }
+      }
+    },
+    "Summarize a meeting in ${applicationName}": {
+      "localizations": {
+        "es": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Resume una reunión en ${applicationName}"
+          }
+        }
+      }
+    },
+    "Take a note in ${applicationName}": {
+      "localizations": {
+        "es": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Toma una nota en ${applicationName}"
+          }
+        }
+      }
+    },
+    "What's on my plate in ${applicationName}": {
+      "localizations": {
+        "es": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Qué tengo pendiente en ${applicationName}"
+          }
+        }
+      }
+    }
+  },
+  "version": "1.0"
+}

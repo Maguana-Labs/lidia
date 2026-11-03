@@ -18,7 +18,7 @@ struct RecordingControlsView: View {
                     Label("Start Recording", systemImage: "mic.fill")
                 }
                 .buttonStyle(.glassProminent)
-                .tint(.red)
+                .tint(Brand.red)
                 .glassEffectID("record", in: controlsNamespace)
             } else {
                 HStack(spacing: 12) {
@@ -28,7 +28,7 @@ struct RecordingControlsView: View {
 
                     Image(systemName: "waveform")
                         .symbolEffect(.variableColor.iterative, isActive: isRecording)
-                        .foregroundStyle(.red)
+                        .foregroundStyle(Brand.red)
 
                     Button {
                         withAnimation(.bouncy) {
@@ -38,7 +38,7 @@ struct RecordingControlsView: View {
                         Label("Stop", systemImage: "stop.fill")
                     }
                     .buttonStyle(.glassProminent)
-                    .tint(.red)
+                    .tint(Brand.red)
                     .glassEffectID("stop", in: controlsNamespace)
                 }
                 .glassEffectID("record", in: controlsNamespace)

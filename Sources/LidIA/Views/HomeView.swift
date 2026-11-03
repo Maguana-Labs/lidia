@@ -1,583 +1,763 @@
-import SwiftUI
+import EventKit
 import SwiftData
+import SwiftUI
 
-/// Home detail — "What needs your attention" dashboard.
-/// Meetings belong in the Meetings tab, not here.
-struct HomeView: View {
-    @Query(filter: #Predicate<ActionItem> { !$0.isCompleted })
-    private var openActionItems: [ActionItem]
+/// Today: Coming up first (today and the next days, every meeting, with
+/// Join/Record and the meeting's project), then anything that needs
+/// attention, LidIA's suggestions with their reasons (follow-up emails, new
+/// projects, patterns, briefs), meetings to pick up again and open action
+/// items. Says plainly when no calendar is connected.
+struct TodayView: View {
+    @Query(sort: \Meeting.date, order: .reverse) private var meetings: [Meeting]
+    @Query(filter: #Predicate<ActionItem> { !$0.isCompleted }) private var openActionItems: [ActionItem]
     @Query(filter: #Predicate<InboxNotification> { !$0.isRead }, sort: \InboxNotification.createdAt, order: .reverse)
     private var unreadNotifications: [InboxNotification]
-    @Query(sort: \Meeting.date, order: .reverse)
-    private var meetings: [Meeting]
 
     @Environment(AppSettings.self) private var settings
     @Environment(RecordingSession.self) private var session
+    @Environment(EventKitManager.self) private var eventKitManager
     @Environment(GoogleCalendarMonitor.self) private var googleCalendarMonitor
+    @Environment(ModelManager.self) private var modelManager
     @Environment(\.modelContext) private var modelContext
 
-    var selectedFolder: String?
-    var onSelectEvent: ((GoogleCalendarClient.CalendarEvent) -> Void)?
-    var onRecord: ((GoogleCalendarClient.CalendarEvent) -> Void)?
-    var onRecordAppleEvent: ((EventKitManager.CalendarEvent) -> Void)?
-    var onSelectMeeting: ((Meeting) -> Void)?
-    var onQuickNote: (() -> Void)?
-    var onOpenActionItems: (() -> Void)?
+    let agenda: [AgendaEvent]
+    var onOpenEvent: (AgendaEvent) -> Void
+    var onRecordEvent: (AgendaEvent, _ join: Bool) -> Void
+    var onRecordNow: () -> Void
+    var onStopRecording: () -> Void
+    var onOpenMeeting: (Meeting) -> Void
+    var onRetryMeeting: (Meeting) -> Void
+    var onNewNote: () -> Void
+    var onOpenActionItems: () -> Void
+    var onOpenLibrary: () -> Void = {}
+    var onOpenProject: (String) -> Void = { _ in }
+    var onOpenSeries: (String) -> Void = { _ in }
+    var onAsk: (String) -> Void = { _ in }
 
-    @State private var hoveredNudgeID: UUID?
-    @State private var editingNudgeID: UUID?
-    @State private var editDraft: String = ""
-    @State private var dispatchStatus: [UUID: String] = [:]  // "sending", "sent", "copied", "failed"
+    @State private var intelligence = IntelligenceResults.empty
+    @State private var showsAllSuggestions = false
+    @State private var intentSheet: IntentSheetItem?
 
-    // MARK: - Derived Data
-
-    private var nextEvent: GoogleCalendarClient.CalendarEvent? {
-        googleCalendarMonitor.upcomingEvents
-            .filter { $0.end > .now }
-            .sorted { $0.start < $1.start }
-            .first
+    /// Every open item with a prepared intent.
+    private var intentCandidates: [IntentSuggestions.Candidate] {
+        openActionItems.compactMap { item in
+            guard !item.isDeleted, let meeting = item.meeting, let intent = IntentStore.shared.intent(for: item.id) else { return nil }
+            return IntentSuggestions.Candidate(intent: intent, itemTitle: item.title, meetingID: meeting.id, meetingDate: meeting.date)
+        }
     }
 
-    private var recentMeetingsCount: Int {
-        let calendar = Calendar.current
-        return meetings.filter { calendar.isDateInToday($0.date) && $0.status == .complete }.count
+    /// The intents For You shows (recent, ready, not already a follow-up card).
+    private var pickedIntents: [IntentSuggestions.Candidate] {
+        IntentSuggestions.pick(intentCandidates, followUpMeetingIDs: Set(intelligence.followUps.map(\.meetingID)))
     }
 
-    private var urgentActionItems: [ActionItem] {
-        openActionItems.filter { $0.isUrgent }.prefix(3).map { $0 }
+    /// Recent meetings with open items: their intents are worked out in the background.
+    private var recentIntentMeetingIDs: [UUID] {
+        let cutoff = Date.now.addingTimeInterval(-Double(IntentSuggestions.maxAgeDays) * 86_400)
+        var ids: [UUID] = []
+        for item in openActionItems where !item.isDeleted {
+            if let meeting = item.meeting, meeting.date >= cutoff, meeting.status == .complete, !ids.contains(meeting.id) { ids.append(meeting.id) }
+        }
+        return ids
     }
 
-    // MARK: - Body
+    private var isCalendarConnected: Bool {
+        googleCalendarMonitor.isSignedIn
+            || (settings.calendarEnabled && eventKitManager.calendarAuthorizationStatus == .fullAccess)
+    }
+
+    /// Briefs and drafts worth acting on; "meeting processed" receipts aren't suggestions.
+    private var inboxSuggestions: [InboxNotification] {
+        let intents = intentCandidates
+        return unreadNotifications.filter { notification in
+            guard !notification.isDeleted, notification.type != "processed" else { return false }
+            // A card about an item that now has an intent would show it twice.
+            if ["follow_up", "ticket", "reminder"].contains(notification.type),
+               IntentSuggestions.isCoveredByIntent(actionItemTitle: notification.sourceActionItemTitle, meetingID: notification.meetingID, intents: intents) {
+                return false
+            }
+            return true
+        }
+    }
+
+    private var attentionMeetings: [Meeting] {
+        MeetingListModel.attentionItems(meetings)
+    }
+
+    private var recentMeetings: [Meeting] {
+        Array(meetings.lazy.filter { $0.status == .complete && !$0.isDeleted }.prefix(3))
+    }
+
+    /// Due today or overdue first, then urgent, then the newest.
+    private var topActionItems: [ActionItem] {
+        let endOfToday = Calendar.current.date(byAdding: .day, value: 1, to: Calendar.current.startOfDay(for: .now)) ?? .now
+        return openActionItems
+            .filter { !$0.isDeleted }
+            .sorted { lhs, rhs in
+                func rank(_ item: ActionItem) -> Int {
+                    if let deadline = item.deadlineDate, deadline < endOfToday { return 0 }
+                    return item.isUrgent ? 1 : 2
+                }
+                let (l, r) = (rank(lhs), rank(rhs))
+                if l != r { return l < r }
+                return (lhs.meeting?.date ?? .distantPast) > (rhs.meeting?.date ?? .distantPast)
+            }
+    }
 
     var body: some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: 20) {
-                // Recording banner
-                if session.isRecording {
-                    recordingBanner
+        TimelineView(.periodic(from: .now, by: 60)) { context in
+            ScrollView {
+                VStack(alignment: .leading, spacing: 32) {
+                    header(now: context.date)
+                    if session.isRecording { recordingCard }
+                    comingUpSection(now: context.date)
+                    if !attentionMeetings.isEmpty { needsAttentionSection }
+                    if suggestionCount > 0 { forYouSection }
+                    if !recentMeetings.isEmpty { recentSection }
+                    if !openActionItems.isEmpty { actionItemsSection }
                 }
-
-                // Greeting + stats
-                greetingSection
-
-                // Next up card
-                if let event = nextEvent {
-                    nextUpCard(event)
-                }
-
-                // Insights — proactive briefs + nudges (always visible so users
-                // discover the surface even when empty).
-                insightsSection
-
-                // Action items focus
-                if !openActionItems.isEmpty {
-                    actionItemsSection
-                }
-
-                // Quick actions
-                quickActionsRow
+                .padding(.horizontal, 32)
+                .padding(.vertical, 28)
+                .frame(maxWidth: 820, alignment: .leading)
+                .frame(maxWidth: .infinity, alignment: .center)
             }
-            .padding(24)
         }
-        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
-        .navigationTitle("Home")
-    }
-
-    // MARK: - Greeting
-
-    private var greetingSection: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            Text(greeting)
-                .font(.largeTitle.bold())
-
-            HStack(spacing: 16) {
-                if recentMeetingsCount > 0 {
-                    Label("\(recentMeetingsCount) meetings today", systemImage: "calendar")
-                        .font(.subheadline)
-                        .foregroundStyle(.secondary)
-                }
-                if !openActionItems.isEmpty {
-                    Label("\(openActionItems.count) open items", systemImage: "checklist")
-                        .font(.subheadline)
-                        .foregroundStyle(.orange)
-                }
-                if !unreadNotifications.isEmpty {
-                    Label("\(unreadNotifications.count) for you", systemImage: "sparkles")
-                        .font(.subheadline)
-                        .foregroundStyle(Color.accentColor)
-                }
-            }
+        .navigationTitle("Today")
+        .intelligence(meetings: meetings, events: agenda, results: $intelligence, autoAssign: true)
+        .task(id: recentIntentMeetingIDs) {
+            IntentRuntime.refresh(
+                meetingIDs: recentIntentMeetingIDs, settings: settings, modelManager: modelManager,
+                eventKit: eventKitManager, google: googleCalendarMonitor, modelContext: modelContext
+            )
+        }
+        .sheet(item: $intentSheet) { sheet in
+            IntentConfirmSheet(intent: sheet.intent, item: sheet.item, meeting: sheet.meeting)
         }
     }
 
-    private var greeting: String {
-        let hour = Calendar.current.component(.hour, from: .now)
+    // MARK: - Header
+
+    private func header(now: Date) -> some View {
+        HStack(alignment: .bottom, spacing: 16) {
+            VStack(alignment: .leading, spacing: 4) {
+                Text(now.formatted(.dateTime.weekday(.wide).month(.wide).day()))
+                    .font(.subheadline.weight(.medium))
+                    .foregroundStyle(.secondary)
+                Text(greeting(now: now))
+                    .font(.system(size: 30, weight: .bold))
+                    .accessibilityAddTraits(.isHeader)
+            }
+            Spacer(minLength: 16)
+            HStack(spacing: 8) {
+                Button(action: onNewNote) {
+                    Label("New Note", systemImage: "square.and.pencil")
+                }
+                .buttonStyle(.glass)
+                .help("Write a note without recording (⌘N)")
+                if !session.isRecording {
+                    Button(action: onRecordNow) {
+                        Label("Record", systemImage: "record.circle")
+                    }
+                    .buttonStyle(.glassProminent)
+                    .tint(Brand.red)
+                    .help("Start recording now (⌘R)")
+                }
+            }
+            .controlSize(.large)
+        }
+    }
+
+    private func greeting(now: Date) -> String {
+        let hour = Calendar.current.component(.hour, from: now)
         let name = settings.displayName.components(separatedBy: " ").first ?? ""
         let prefix = switch hour {
         case 0..<12: "Good morning"
-        case 12..<17: "Good afternoon"
+        case 12..<18: "Good afternoon"
         default: "Good evening"
         }
         return name.isEmpty ? prefix : "\(prefix), \(name)"
     }
 
-    // MARK: - Next Up
-
-    private func nextUpCard(_ event: GoogleCalendarClient.CalendarEvent) -> some View {
-        let eventColor = Color.fromHex(event.colorHex) ?? .orange
-
-        return Button {
-            onSelectEvent?(event)
-        } label: {
-            HStack(spacing: 0) {
-                RoundedRectangle(cornerRadius: 2)
-                    .fill(eventColor)
-                    .frame(width: 4)
-
-                VStack(alignment: .leading, spacing: 6) {
-                    Text("Next up")
-                        .font(.caption.weight(.semibold))
-                        .foregroundStyle(.secondary)
-                        .textCase(.uppercase)
-
-                    Text(event.title)
-                        .font(.headline)
-                        .lineLimit(1)
-
-                    HStack(spacing: 8) {
-                        Text(event.start, style: .relative)
-                            .font(.subheadline)
-                            .foregroundStyle(.secondary)
-
-                        if !event.attendees.isEmpty {
-                            Text("\u{00B7} \(event.attendees.count) attendees")
-                                .font(.subheadline)
-                                .foregroundStyle(.tertiary)
-                        }
-                    }
-                }
-                .padding(14)
-
-                Spacer()
-
-                if event.meetingLink != nil {
-                    Button("Join & Record", systemImage: "mic.fill") {
-                        onRecord?(event)
-                    }
-                    .font(.subheadline.weight(.medium))
-                    .buttonStyle(.borderedProminent)
-                    .tint(.green)
-                    .controlSize(.regular)
-                    .padding(.trailing, 14)
-                }
-            }
-            .contentShape(Rectangle())
-        }
-        .buttonStyle(.plain)
-        .glassEffect(.regular.tint(eventColor.opacity(0.08)).interactive(), in: .rect(cornerRadius: 12))
-    }
-
-    // MARK: - Nudges
-
-    private var prepNotifications: [InboxNotification] {
-        unreadNotifications.filter { $0.type == "meeting_prep" }
-    }
-    private var otherNotifications: [InboxNotification] {
-        unreadNotifications.filter { $0.type != "meeting_prep" }
-    }
-
-    private var insightsSection: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            HStack {
-                Label("Insights", systemImage: "sparkles")
+    private var recordingCard: some View {
+        HStack(spacing: 12) {
+            Circle().fill(Brand.red).frame(width: 9, height: 9)
+                .accessibilityHidden(true)
+            VStack(alignment: .leading, spacing: 1) {
+                Text(session.currentMeeting.map { $0.title.isEmpty ? "Untitled" : $0.title } ?? "Recording")
                     .font(.headline)
-                Spacer()
-                if unreadNotifications.isEmpty {
-                    Text("Quiet for now")
-                        .font(.caption)
-                        .foregroundStyle(.tertiary)
+                    .lineLimit(1)
+                TimelineView(.periodic(from: .now, by: 1)) { _ in
+                    Text((session.isPaused ? "Paused · " : "Recording · ") + ElapsedFormat.string(session.elapsedTime))
+                        .font(.callout.monospacedDigit())
+                        .foregroundStyle(.secondary)
                 }
             }
-
-            // Featured: upcoming meeting brief(s)
-            ForEach(prepNotifications.prefix(2)) { notif in
-                meetingPrepCard(notif)
+            Spacer(minLength: 12)
+            Button("Open Notes") {
+                if let meeting = session.currentMeeting { onOpenMeeting(meeting) }
             }
-
-            // Other dispatcher cards (processed, follow-ups, reminders…)
-            ForEach(otherNotifications.prefix(5)) { notif in
-                dispatcherCard(notif)
+            .buttonStyle(.glass)
+            Button(role: .destructive, action: onStopRecording) {
+                Label("Stop", systemImage: "stop.fill")
             }
-
-            // Empty-state guidance
-            if unreadNotifications.isEmpty {
-                insightsEmptyState
-            }
-        }
-    }
-
-    private var insightsEmptyState: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            Text("Briefs for your next meeting appear here ~15 minutes before it starts — covering the last conversation with those attendees, open action items, and what to prepare for.")
-                .font(.caption)
-                .foregroundStyle(.secondary)
-            Text("After a meeting, action items, follow-up drafts, and reminders surface here too.")
-                .font(.caption)
-                .foregroundStyle(.tertiary)
+            .buttonStyle(.glassProminent)
+            .tint(Brand.red)
+            .help("Stop recording (⌘R)")
         }
         .padding(14)
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .glassEffect(.regular.tint(.purple.opacity(0.04)), in: .rect(cornerRadius: 10))
+        .lidiaCard(tint: Brand.red)
     }
 
-    private func meetingPrepCard(_ notif: InboxNotification) -> some View {
-        let isHovered = hoveredNudgeID == notif.id
-        return VStack(alignment: .leading, spacing: 8) {
-            HStack(spacing: 8) {
-                Image(systemName: notif.typeIcon)
-                    .font(.subheadline)
-                    .foregroundStyle(.purple)
-                Text(notif.title)
-                    .font(.subheadline.weight(.semibold))
-                    .lineLimit(1)
-                Spacer()
-                Button {
-                    withAnimation { notif.isRead = true }
-                } label: {
-                    Image(systemName: "xmark")
-                        .font(.system(size: 9, weight: .bold))
-                        .frame(width: 16, height: 16)
-                        .contentShape(.rect)
-                }
-                .buttonStyle(.plain)
-                .foregroundStyle(.tertiary)
-                .opacity(isHovered ? 1 : 0)
+    // MARK: - Coming up
+
+    @ViewBuilder
+    private func comingUpSection(now: Date) -> some View {
+        if !isCalendarConnected && agenda.isEmpty {
+            VStack(alignment: .leading, spacing: 12) {
+                sectionHeader("Coming up")
+                connectCalendarCard
             }
-            Text(notif.body)
-                .font(.callout)
-                .foregroundStyle(.primary)
-                .textSelection(.enabled)
-                .fixedSize(horizontal: false, vertical: true)
-        }
-        .padding(.horizontal, 14)
-        .padding(.vertical, 12)
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .glassEffect(
-            .regular.tint(.purple.opacity(isHovered ? 0.10 : 0.06)).interactive(),
-            in: .rect(cornerRadius: 10)
-        )
-        .onHover { h in
-            withAnimation(.easeInOut(duration: 0.12)) { hoveredNudgeID = h ? notif.id : nil }
+        } else {
+            ComingUpCard(
+                agenda: agenda,
+                now: now,
+                eventProjects: intelligence.eventProjects,
+                isRecording: session.isRecording,
+                onOpenEvent: onOpenEvent,
+                onRecordEvent: onRecordEvent
+            )
         }
     }
 
-    private func dispatcherCard(_ notif: InboxNotification) -> some View {
-        let isHovered = hoveredNudgeID == notif.id
-        let isEditing = editingNudgeID == notif.id
-        let status = dispatchStatus[notif.id]
+    private var connectCalendarCard: some View {
+        HStack(alignment: .top, spacing: 14) {
+            SettingsIconTile(symbol: "calendar", tint: Brand.red, size: 34)
+            VStack(alignment: .leading, spacing: 4) {
+                Text("Connect a calendar")
+                    .font(.headline)
+                Text("See today's and the coming days' meetings here with a one-click Record, and get a nudge before each one. LidIA reads Apple Calendar or Google Calendar on this Mac.")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                Button("Connect Calendar…") {
+                    SettingsRouter.shared.open(.calendars)
+                }
+                .buttonStyle(.glassProminent)
+                .padding(.top, 6)
+            }
+            Spacer(minLength: 0)
+        }
+        .padding(16)
+        .lidiaCard()
+    }
 
-        return VStack(alignment: .leading, spacing: 8) {
-            // Header: icon + title + edit/dismiss
-            HStack(spacing: 8) {
-                Image(systemName: notif.typeIcon)
-                    .font(.subheadline)
-                    .foregroundStyle(.orange)
+    // MARK: - For you (on-device suggestions)
 
-                Text(notif.title)
-                    .font(.subheadline.weight(.semibold))
-                    .lineLimit(1)
+    private enum Suggestion: Identifiable {
+        case followUp(FollowUpPlanner.Draft)
+        case cluster(ProjectSuggester.Cluster)
+        case pattern(PatternDetector.Pattern)
+        case inbox(InboxNotification)
+        case intent(IntentSuggestions.Candidate)
 
+        var id: String {
+            switch self {
+            case .intent(let candidate): "intent:" + candidate.intent.itemID.uuidString
+            case .followUp(let draft): draft.id
+            case .cluster(let cluster): "cluster:" + cluster.id
+            case .pattern(let pattern): pattern.id
+            case .inbox(let notification): "inbox:" + notification.id.uuidString
+            }
+        }
+    }
+
+    /// Most useful first: what to send, what's next, how to organise, then the rest.
+    private var suggestions: [Suggestion] {
+        let reviews = intelligence.patterns.filter { if case .seriesReview = $0.kind { return true } else { return false } }
+        let stale = intelligence.patterns.filter { if case .staleItems = $0.kind { return true } else { return false } }
+        var result: [Suggestion] = []
+        result += intelligence.followUps.prefix(2).map(Suggestion.followUp)
+        result += pickedIntents.map(Suggestion.intent)
+        result += reviews.prefix(1).map(Suggestion.pattern)
+        result += intelligence.clusters.prefix(2).map(Suggestion.cluster)
+        result += stale.prefix(2).map(Suggestion.pattern)
+        result += inboxSuggestions.prefix(3).map(Suggestion.inbox)
+        result += intelligence.followUps.dropFirst(2).map(Suggestion.followUp)
+        result += intelligence.clusters.dropFirst(2).map(Suggestion.cluster)
+        return result
+    }
+
+    private var suggestionCount: Int {
+        intelligence.followUps.count + intelligence.patterns.count + intelligence.clusters.count + inboxSuggestions.count + pickedIntents.count
+    }
+
+    private var forYouSection: some View {
+        let all = suggestions
+        let visible = showsAllSuggestions ? all : Array(all.prefix(4))
+        return VStack(alignment: .leading, spacing: 12) {
+            HStack(alignment: .firstTextBaseline, spacing: 8) {
+                sectionHeader("For You")
+                Label("On this Mac", systemImage: "lock.fill")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .help("LidIA finds these from your own meetings, on this Mac. Nothing is sent anywhere.")
                 Spacer()
+                if all.count > 4 {
+                    Button(showsAllSuggestions ? "Show Fewer" : "Show All \(all.count)") {
+                        withAnimation(.easeOut(duration: 0.15)) { showsAllSuggestions.toggle() }
+                    }
+                    .buttonStyle(.accentLink)
+                    .font(.callout)
+                }
+            }
+            ForEach(visible) { suggestion in
+                suggestionCard(suggestion)
 
-                if isHovered {
-                    if notif.isDispatchable {
-                        Button("Edit", systemImage: "pencil") {
-                            editDraft = notif.draft ?? notif.body
-                            editingNudgeID = isEditing ? nil : notif.id
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func suggestionCard(_ suggestion: Suggestion) -> some View {
+        switch suggestion {
+        case .followUp(let draft):
+            FollowUpCard(draft: draft) {
+                if let meeting = meetings.first(where: { $0.id == draft.meetingID }) { onOpenMeeting(meeting) }
+            }
+        case .cluster(let cluster):
+            let members = meetings.filter { cluster.meetingIDs.contains($0.id) }
+            ClusterCard(
+                cluster: cluster,
+                meetingTitles: Array(Set(members.map { $0.title.trimmingCharacters(in: .whitespaces) })).sorted(),
+                companies: Array(Set(members.flatMap { AttendeeGrouping.externalCompanies($0.libraryAttendees) })).sorted(),
+                onCreate: { name in
+                    withAnimation {
+                        IntelligenceEngine.assign(cluster.meetingIDs, to: name, in: meetings, store: .shared, context: modelContext)
+                    }
+                    onOpenProject(name)
+                }
+            )
+        case .pattern(let pattern):
+            switch pattern.kind {
+            case .seriesReview(let key, let title, _, _):
+                PatternCard(
+                    pattern: pattern,
+                    onPrimary: { onOpenSeries(key) },
+                    onAsk: { onAsk("Recap the last 3 “\(title)” meetings: what was decided, what's still open, and what I should raise next time.") }
+                )
+            case .staleItems(let group, _, let project):
+                PatternCard(
+                    pattern: pattern,
+                    onPrimary: {
+                        if let project { onOpenProject(project) } else { onOpenActionItems() }
+                    },
+                    onAsk: { onAsk("Which of my open \(group) action items are blocked, and what would unblock them?") }
+                )
+            }
+        case .inbox(let notification):
+            InsightCard(notification: notification, onOpenMeeting: { id in
+                if let meeting = meetings.first(where: { $0.id == id }) { onOpenMeeting(meeting) }
+            })
+        case .intent(let candidate):
+            if let item = openActionItems.first(where: { $0.id == candidate.intent.itemID }), let meeting = item.meeting {
+                IntentForYouCard(
+                    candidate: candidate, item: item, meeting: meeting,
+                    onOpen: { intentSheet = IntentSheetItem(intent: $0, item: item, meeting: meeting) },
+                    onOpenMeeting: { onOpenMeeting(meeting) }
+                )
+            }
+        }
+    }
+
+    // MARK: - Needs attention
+
+    private var needsAttentionSection: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            sectionHeader("Needs Attention")
+            VStack(spacing: 0) {
+                ForEach(Array(attentionMeetings.enumerated()), id: \.element.id) { index, meeting in
+                    if index > 0 { Divider() }
+                    HStack(spacing: 10) {
+                        Button {
+                            onOpenMeeting(meeting)
+                        } label: {
+                            VStack(alignment: .leading, spacing: 2) {
+                                HStack(spacing: 6) {
+                                    Text(meeting.title.isEmpty ? "Untitled" : meeting.title)
+                                        .lineLimit(1)
+                                    MeetingStatusBadge(status: meeting.status)
+                                }
+                                Text(meeting.processingError ?? meeting.date.formatted(date: .abbreviated, time: .shortened))
+                                    .font(.callout)
+                                    .foregroundStyle(.secondary)
+                                    .lineLimit(2)
+                            }
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .contentShape(.rect)
                         }
-                        .labelStyle(.iconOnly)
-                        .font(.caption2)
                         .buttonStyle(.plain)
-                        .foregroundStyle(.secondary)
-                    }
+                        .accessibilityHint("Opens the meeting")
 
-                    Button("Dismiss", systemImage: "xmark") {
-                        withAnimation { notif.isRead = true }
-                    }
-                    .labelStyle(.iconOnly)
-                    .font(.caption2)
-                    .buttonStyle(.plain)
-                    .foregroundStyle(.tertiary)
-                }
-            }
-
-            // Draft body (editable or static)
-            if isEditing {
-                TextField("Edit draft...", text: $editDraft, axis: .vertical)
-                    .textFieldStyle(.plain)
-                    .font(.caption)
-                    .lineLimit(3...6)
-                    .padding(8)
-                    .glassEffect(.regular, in: .rect(cornerRadius: 6))
-            } else if let draft = notif.draft {
-                Text(draft)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(3)
-                    .textSelection(.enabled)
-            } else {
-                Text(notif.body)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(2)
-            }
-
-            // Recipient hint
-            if let recipient = notif.recipient {
-                HStack(spacing: 4) {
-                    Image(systemName: "person")
-                        .font(.caption2)
-                        .foregroundStyle(.tertiary)
-                    Text(recipient)
-                        .font(.caption2)
-                        .foregroundStyle(.tertiary)
-                }
-            }
-
-            // Action buttons
-            if notif.isDispatchable || status != nil {
-                HStack(spacing: 8) {
-                    if let status {
-                        Label(
-                            status == "sent" ? "Sent" : status == "copied" ? "Copied" : status == "failed" ? "Failed" : "Sending...",
-                            systemImage: status == "sent" || status == "copied" ? "checkmark.circle.fill" : status == "failed" ? "xmark.circle" : "arrow.up.circle"
-                        )
-                        .font(.caption.weight(.medium))
-                        .foregroundStyle(status == "failed" ? .red : .green)
-                    } else {
-                        // Send via n8n
-                        if settings.n8nEnabled && !settings.n8nWebhookURL.isEmpty {
+                        if meeting.status == .failed || meeting.status == .queued {
                             Button {
-                                sendViaN8n(notif)
+                                onRetryMeeting(meeting)
                             } label: {
-                                Label(n8nButtonLabel(notif.channel), systemImage: "paperplane.fill")
-                                    .font(.caption.weight(.medium))
+                                Label("Retry", systemImage: "arrow.clockwise")
                             }
                             .buttonStyle(.glass)
-                            .controlSize(.small)
+                            .help(meeting.rawTranscript.isEmpty
+                                  ? "Transcribe the saved recording and write the notes"
+                                  : "Process this meeting again")
+                            .accessibilityLabel("Retry \(meeting.title.isEmpty ? "Untitled" : meeting.title)")
                         }
+                    }
+                    .padding(.vertical, 10)
+                }
+            }
+            .padding(.horizontal, 14)
+            .lidiaCard(tint: .orange)
+        }
+    }
 
-                        // Copy draft
+    // MARK: - Pick up where you left off
+
+    private var recentSection: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack(alignment: .firstTextBaseline) {
+                sectionHeader("Recent Meetings")
+                Spacer()
+                Button("All Meetings", action: onOpenLibrary)
+                    .buttonStyle(.accentLink)
+                    .font(.callout)
+            }
+            LazyVGrid(columns: [GridItem(.adaptive(minimum: 200), spacing: 12)], alignment: .leading, spacing: 12) {
+                ForEach(recentMeetings) { meeting in
+                    RecentMeetingCard(meeting: meeting) { onOpenMeeting(meeting) }
+                }
+            }
+        }
+    }
+
+    // MARK: - Action items
+
+    private var actionItemsSection: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack(alignment: .firstTextBaseline) {
+                sectionHeader("Open Action Items")
+                Text("\(openActionItems.count)")
+                    .font(.callout.monospacedDigit())
+                    .foregroundStyle(.secondary)
+                Spacer()
+                Button("View All", action: onOpenActionItems)
+                    .buttonStyle(.accentLink)
+                    .font(.callout)
+            }
+            VStack(alignment: .leading, spacing: 8) {
+                ForEach(topActionItems.prefix(5)) { item in
+                    DueActionItemRow(item: item, onOpenMeeting: onOpenMeeting)
+                }
+            }
+            .padding(14)
+            .lidiaCard()
+        }
+    }
+
+    private func sectionHeader(_ title: String) -> some View {
+        Text(title)
+            .font(.title3.weight(.semibold))
+            .accessibilityAddTraits(.isHeader)
+    }
+}
+
+// MARK: - Recent meeting card
+
+private struct RecentMeetingCard: View {
+    let meeting: Meeting
+    var onOpen: () -> Void
+
+    @State private var hovering = false
+
+    var body: some View {
+        Button(action: onOpen) {
+            VStack(alignment: .leading, spacing: 6) {
+                Text(meeting.title.isEmpty ? "Untitled" : meeting.title.trimmingCharacters(in: .whitespaces))
+                    .font(.callout.weight(.semibold))
+                    .lineLimit(2, reservesSpace: true)
+                    .multilineTextAlignment(.leading)
+                Text(subtitle)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                if let project = meeting.projectName {
+                    ProjectLabel(name: project)
+                }
+                Text(SummaryPreview.lines(from: meeting.userEditedSummary ?? meeting.summary, limit: 2).joined(separator: " "))
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(3, reservesSpace: true)
+                    .multilineTextAlignment(.leading)
+            }
+            .padding(12)
+            .frame(maxWidth: .infinity, alignment: .topLeading)
+            .background(Color.primary.opacity(hovering ? 0.07 : 0.035), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+            .overlay(RoundedRectangle(cornerRadius: 12, style: .continuous).strokeBorder(Color(nsColor: .separatorColor).opacity(0.5), lineWidth: 0.5))
+            .contentShape(.rect)
+        }
+        .buttonStyle(.plain)
+        .onHover { hovering = $0 }
+        .animation(.easeOut(duration: 0.12), value: hovering)
+        .accessibilityElement(children: .combine)
+        .accessibilityHint("Opens the meeting")
+    }
+
+    private var subtitle: String {
+        var parts = [MeetingRowFormat.relativeDay(meeting.date)]
+        if let who = MeetingRowFormat.withWhom(meeting.libraryAttendees) { parts.append(who) }
+        return parts.joined(separator: " · ")
+    }
+}
+
+// MARK: - Action item row
+
+struct DueActionItemRow: View {
+    @Bindable var item: ActionItem
+    var onOpenMeeting: (Meeting) -> Void
+
+    var body: some View {
+        HStack(alignment: .firstTextBaseline, spacing: 8) {
+            Toggle(isOn: $item.isCompleted) {
+                VStack(alignment: .leading, spacing: 1) {
+                    Text(item.title)
+                        .lineLimit(2)
+                    if !meta.isEmpty {
+                        Text(meta)
+                            .font(.caption)
+                            .foregroundStyle(isOverdue ? .red : .secondary)
+                    }
+                }
+            }
+            .toggleStyle(.checkbox)
+            Spacer(minLength: 8)
+            if let meeting = item.meeting {
+                Button {
+                    onOpenMeeting(meeting)
+                } label: {
+                    Image(systemName: "arrow.up.right")
+                }
+                .buttonStyle(.borderless)
+                .foregroundStyle(.secondary)
+                .help("Open \(meeting.title)")
+                .accessibilityLabel("Open meeting \(meeting.title)")
+            }
+        }
+    }
+
+    private var isOverdue: Bool {
+        guard let deadline = item.deadlineDate else { return false }
+        return deadline < Calendar.current.startOfDay(for: .now)
+    }
+
+    private var meta: String {
+        var parts: [String] = []
+        if let deadline = item.displayDeadline { parts.append("Due \(deadline)") }
+        if let assignee = item.assignee, !assignee.isEmpty { parts.append(assignee) }
+        if let meeting = item.meeting { parts.append(meeting.title.trimmingCharacters(in: .whitespaces)) }
+        return parts.joined(separator: " · ")
+    }
+}
+
+// MARK: - Insight card
+
+/// A meeting brief or follow-up draft from the dispatcher. Its controls are
+/// always visible (not hover-only) so they work from the keyboard.
+struct InsightCard: View {
+    @Bindable var notification: InboxNotification
+    var onOpenMeeting: ((UUID) -> Void)?
+    @Environment(AppSettings.self) private var settings
+
+    @State private var isEditing = false
+    @State private var isExpanded = false
+    @State private var editDraft = ""
+    @State private var status: Status?
+
+    private enum Status { case sending, sent, copied, failed }
+
+    private var isBrief: Bool { notification.type == "meeting_prep" }
+    private var tint: Color { isBrief ? Brand.red : Brand.ember }
+    private var tileTint: Color { isBrief ? Brand.red : Brand.emberSolid }
+
+    private var kindLabel: String {
+        switch notification.type {
+        case "meeting_prep": "Meeting brief"
+        case "follow_up": "Follow-up draft"
+        case "ticket": "Ticket draft"
+        case "reminder": "Reminder"
+        default: "Update"
+        }
+    }
+
+    private var bodyText: String {
+        (notification.draft ?? notification.body).trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(alignment: .top, spacing: 12) {
+                SettingsIconTile(symbol: isBrief ? "doc.text.magnifyingglass" : "paperplane", tint: tileTint, size: 28)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(kindLabel.uppercased())
+                        .font(.caption2.weight(.semibold))
+                        .foregroundStyle(tint)
+                    Text(notification.title.replacingOccurrences(of: "Prep: ", with: ""))
+                        .font(.headline)
+                        .fixedSize(horizontal: false, vertical: true)
+                    // Tickets go to a tracker, never "to" the user.
+                    if let recipient = notification.recipient, notification.type != "ticket",
+                       !IntentSuggestions.isSelfAddressed(recipient: recipient, userName: settings.displayName, userEmails: []) {
+                        Text("To \(recipient)")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+                Spacer(minLength: 8)
+                Button {
+                    withAnimation { notification.isRead = true }
+                } label: {
+                    Image(systemName: "xmark")
+                        .font(.caption.weight(.semibold))
+                        .frame(width: 22, height: 22)
+                        .contentShape(.circle)
+                }
+                .buttonStyle(.borderless)
+                .foregroundStyle(.secondary)
+                .help("Dismiss")
+                .accessibilityLabel("Dismiss \(notification.title)")
+            }
+
+            if isEditing {
+                TextField("Edit draft", text: $editDraft, axis: .vertical)
+                    .textFieldStyle(.roundedBorder)
+                    .lineLimit(3...10)
+            } else if !bodyText.isEmpty {
+                MarkdownBlockView(text: bodyText, textStyle: .secondary)
+                    .lineLimit(isExpanded ? nil : 5)
+                    .frame(maxHeight: isExpanded ? nil : 120, alignment: .top)
+                    .clipped()
+                    .mask(alignment: .top) {
+                        if isExpanded || bodyText.count < 280 {
+                            Rectangle()
+                        } else {
+                            LinearGradient(stops: [.init(color: .black, location: 0.7), .init(color: .clear, location: 1)], startPoint: .top, endPoint: .bottom)
+                        }
+                    }
+                    .textSelection(.enabled)
+            }
+
+            HStack(spacing: 8) {
+                if let status {
+                    statusLabel(status)
+                } else {
+                    if notification.isDispatchable && !isBrief {
+                        if settings.n8nEnabled && !settings.n8nWebhookURL.isEmpty {
+                            Button {
+                                sendViaN8n()
+                            } label: {
+                                Label(n8nButtonLabel, systemImage: "paperplane.fill")
+                            }
+                            .buttonStyle(.glassProminent)
+                        }
                         Button {
-                            copyDraft(notif)
+                            copyDraft()
                         } label: {
-                            Label("Copy draft", systemImage: "doc.on.doc")
-                                .font(.caption.weight(.medium))
+                            Label("Copy", systemImage: "doc.on.doc")
                         }
                         .buttonStyle(.glass)
-                        .controlSize(.small)
-                    }
-
-                    Spacer()
-                }
-            }
-        }
-        .padding(.horizontal, 14)
-        .padding(.vertical, 10)
-        .glassEffect(
-            .regular.tint(.orange.opacity(isHovered ? 0.06 : 0.02)).interactive(),
-            in: .rect(cornerRadius: 10)
-        )
-        .onHover { h in
-            withAnimation(.easeInOut(duration: 0.15)) { hoveredNudgeID = h ? notif.id : nil }
-        }
-    }
-
-    // MARK: - Dispatch Actions
-
-    private func sendViaN8n(_ notif: InboxNotification) {
-        let draftText = editingNudgeID == notif.id ? editDraft : (notif.draft ?? notif.body)
-        dispatchStatus[notif.id] = "sending"
-
-        Task {
-            let payload = N8nClient.DispatchPayload(
-                channel: notif.channel ?? "reminder",
-                recipient: notif.recipient,
-                draft: draftText,
-                ticketTitle: notif.ticketTitle,
-                meetingTitle: notif.sourceMeetingTitle,
-                actionItemTitle: notif.sourceActionItemTitle,
-                actionItemID: notif.id.uuidString
-            )
-
-            let success = await N8nClient.sendDispatch(
-                payload: payload,
-                webhookURL: settings.n8nWebhookURL,
-                authHeader: settings.n8nAuthHeader.isEmpty ? nil : settings.n8nAuthHeader
-            )
-
-            await MainActor.run {
-                withAnimation {
-                    dispatchStatus[notif.id] = success ? "sent" : "failed"
-                    if success {
-                        editingNudgeID = nil
-                        // Auto-dismiss after delay
-                        Task {
-                            try? await Task.sleep(for: .seconds(2))
-                            await MainActor.run {
-                                withAnimation { notif.isRead = true }
-                                dispatchStatus[notif.id] = nil
-                            }
+                        Button {
+                            editDraft = notification.draft ?? notification.body
+                            isEditing.toggle()
+                        } label: {
+                            Label(isEditing ? "Done" : "Edit", systemImage: "pencil")
                         }
+                        .buttonStyle(.glass)
+                    }
+                    if let meetingID = notification.meetingID, let onOpenMeeting, isBrief == false {
+                        Button("Open Meeting") { onOpenMeeting(meetingID) }
+                            .buttonStyle(.glass)
                     }
                 }
+                Spacer(minLength: 0)
+                if !isEditing && bodyText.count >= 280 {
+                    Button(isExpanded ? "Show Less" : "Show More") {
+                        withAnimation(.easeOut(duration: 0.15)) { isExpanded.toggle() }
+                    }
+                    .buttonStyle(.accentLink)
+                    .font(.callout)
+                }
             }
+            .controlSize(.small)
         }
+        .padding(16)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(tint.opacity(0.05), in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: 14, style: .continuous).strokeBorder(tint.opacity(0.22), lineWidth: 0.5))
     }
 
-    private func copyDraft(_ notif: InboxNotification) {
-        let text = editingNudgeID == notif.id ? editDraft : (notif.draft ?? notif.body)
-        NSPasteboard.general.clearContents()
-        NSPasteboard.general.setString(text, forType: .string)
-
-        withAnimation { dispatchStatus[notif.id] = "copied" }
-        Task {
-            try? await Task.sleep(for: .seconds(2))
-            await MainActor.run {
-                withAnimation { dispatchStatus[notif.id] = nil }
-            }
+    private func statusLabel(_ status: Status) -> some View {
+        let (text, image, color): (String, String, Color) = switch status {
+        case .sending: ("Sending…", "arrow.up.circle", .secondary)
+        case .sent: ("Sent", "checkmark.circle.fill", .green)
+        case .copied: ("Copied", "checkmark.circle.fill", .green)
+        case .failed: ("Couldn't send. Check the n8n webhook in Settings › Apps.", "xmark.circle", .red)
         }
+        return Label(text, systemImage: image)
+            .font(.callout.weight(.medium))
+            .foregroundStyle(color)
     }
 
-    private func n8nButtonLabel(_ channel: String?) -> String {
-        switch channel {
+    private var currentDraft: String {
+        isEditing ? editDraft : (notification.draft ?? notification.body)
+    }
+
+    private var n8nButtonLabel: String {
+        switch notification.channel {
         case "slack": "Send to Slack"
-        case "email": "Send email"
-        case "ticket": "Create ticket"
+        case "email": "Send Email"
+        case "ticket": "Create Ticket"
         default: "Send via n8n"
         }
     }
 
-    // MARK: - Action Items
-
-    private var actionItemsSection: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            HStack {
-                Label("Action Items", systemImage: "checklist")
-                    .font(.headline)
-                Spacer()
-                Button {
-                    onOpenActionItems?()
-                } label: {
-                    Text("View all \(openActionItems.count)")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
-                .buttonStyle(.plain)
+    private func sendViaN8n() {
+        let draft = currentDraft
+        status = .sending
+        let payload = N8nClient.DispatchPayload(
+            channel: notification.channel ?? "reminder",
+            recipient: notification.recipient,
+            draft: draft,
+            ticketTitle: notification.ticketTitle,
+            meetingTitle: notification.sourceMeetingTitle,
+            actionItemTitle: notification.sourceActionItemTitle,
+            actionItemID: notification.id.uuidString
+        )
+        let webhookURL = settings.n8nWebhookURL
+        let authHeader = settings.n8nAuthHeader.isEmpty ? nil : settings.n8nAuthHeader
+        Task {
+            let success = await N8nClient.sendDispatch(payload: payload, webhookURL: webhookURL, authHeader: authHeader)
+            withAnimation { status = success ? .sent : .failed }
+            if success {
+                isEditing = false
+                try? await Task.sleep(for: .seconds(2))
+                withAnimation { notification.isRead = true }
             }
-
-            if !urgentActionItems.isEmpty {
-                ForEach(urgentActionItems) { item in
-                    HStack(spacing: 10) {
-                        Image(systemName: "exclamationmark.circle.fill")
-                            .font(.subheadline)
-                            .foregroundStyle(.red)
-                        VStack(alignment: .leading, spacing: 2) {
-                            Text(item.title)
-                                .font(.subheadline)
-                                .lineLimit(1)
-                            if let assignee = item.assignee, !assignee.isEmpty {
-                                Text(assignee)
-                                    .font(.caption2)
-                                    .foregroundStyle(.tertiary)
-                            }
-                        }
-                        Spacer()
-                    }
-                    .padding(.horizontal, 14)
-                    .padding(.vertical, 8)
-                    .glassEffect(.regular.tint(.red.opacity(0.04)), in: .rect(cornerRadius: 8))
-                }
-            }
-
-            // Summary bar
-            Button {
-                onOpenActionItems?()
-            } label: {
-                HStack(spacing: 10) {
-                    Text("\(openActionItems.count) open")
-                        .font(.subheadline.weight(.medium))
-                        .foregroundStyle(.orange)
-                    Spacer()
-                    Text("Open dashboard")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                    Image(systemName: "chevron.right")
-                        .font(.caption2)
-                        .foregroundStyle(.tertiary)
-                }
-                .padding(.horizontal, 14)
-                .padding(.vertical, 10)
-            }
-            .buttonStyle(.plain)
-            .glassEffect(.regular.tint(.orange.opacity(0.04)).interactive(), in: .rect(cornerRadius: 10))
         }
     }
 
-    // MARK: - Quick Actions
-
-    private var quickActionsRow: some View {
-        HStack(spacing: 10) {
-            Button {
-                onQuickNote?()
-            } label: {
-                Label("Quick Note", systemImage: "square.and.pencil")
-                    .font(.subheadline)
-            }
-            .buttonStyle(.glass)
-
-            if let event = nextEvent, event.meetingLink != nil {
-                Button {
-                    onRecord?(event)
-                } label: {
-                    Label("Join Next Meeting", systemImage: "video.fill")
-                        .font(.subheadline)
-                }
-                .buttonStyle(.glass)
-            }
+    private func copyDraft() {
+        ExportService.copyToClipboard(currentDraft)
+        withAnimation { status = .copied }
+        Task {
+            try? await Task.sleep(for: .seconds(2))
+            withAnimation { status = nil }
         }
-        .padding(.top, 8)
-    }
-
-    // MARK: - Recording Banner
-
-    private var recordingBanner: some View {
-        HStack(spacing: 10) {
-            Circle()
-                .fill(.red)
-                .frame(width: 8, height: 8)
-                .modifier(PulseEffect())
-
-            Text("Recording")
-                .font(.subheadline.bold())
-                .foregroundStyle(.red)
-
-            Text(formatTime(session.elapsedTime))
-                .font(.system(.subheadline, design: .monospaced))
-                .foregroundStyle(.secondary)
-
-            Spacer()
-
-            if let meeting = session.currentMeeting {
-                Button("View") { onSelectMeeting?(meeting) }
-                    .font(.caption.bold())
-                    .buttonStyle(.borderedProminent)
-                    .tint(.red)
-                    .controlSize(.small)
-            }
-        }
-        .padding(.horizontal, 16)
-        .padding(.vertical, 12)
-        .glassEffect(.regular.tint(.red.opacity(0.15)).interactive(), in: .rect(cornerRadius: 10))
     }
 }

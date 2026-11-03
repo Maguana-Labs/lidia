@@ -51,11 +51,16 @@ private final class AudioTapBuffer: @unchecked Sendable {
 final class AudioCaptureSession: @unchecked Sendable {
     private let buffer = AudioTapBuffer()
     private var engine: AVAudioEngine?
+    /// The microphone's native rate (44.1 kHz on many Macs, 16/24 kHz on
+    /// headsets). Callers must resample from this, not assume 48 kHz.
+    private(set) var sampleRate = 48_000
 
     func start() throws {
         let engine = AVAudioEngine()
         let inputNode = engine.inputNode
         let format = inputNode.outputFormat(forBus: 0)
+        // No input device: a 0 Hz / 0-channel format makes installTap raise an exception.
+        try AudioCaptureError.checkInputFormat(sampleRate: format.sampleRate, channelCount: format.channelCount)
 
         // Capture only the buffer — NOT self — to avoid any actor isolation inheritance.
         let buf = buffer
@@ -82,6 +87,7 @@ final class AudioCaptureSession: @unchecked Sendable {
 
         try engine.start()
         self.engine = engine
+        sampleRate = Int(format.sampleRate)
     }
 
     func stop() {
@@ -142,6 +148,9 @@ final class VoiceInputController {
     private var audioSamples: [Float] = []
     private var drainTimer: Timer?
 
+    /// Sample rate of the samples `stopListening()` returns.
+    private(set) var captureSampleRate = 48_000
+
     func startListening() {
         // Allow restarting from idle or from other states in a session
         state = .listening
@@ -180,9 +189,11 @@ final class VoiceInputController {
         } else if state == .listening {
             // Resume capture
             let session = AudioCaptureSession()
+            session.setSilenceDuration(silenceDuration)
             do {
                 try session.start()
                 self.captureSession = session
+                captureSampleRate = session.sampleRate
             } catch {
                 Self.logger.error("Failed to resume capture after unmute: \(error)")
             }
@@ -228,6 +239,8 @@ final class VoiceInputController {
     // MARK: - Global Hotkey
 
     func registerHotkey() {
+        // Idempotent: a second registration would toggle twice per press (on, off).
+        unregisterHotkey()
         globalMonitor = NSEvent.addGlobalMonitorForEvents(matching: [.keyDown]) { [weak self] event in
             Task { @MainActor in
                 self?.handleKeyEvent(event)
@@ -253,14 +266,26 @@ final class VoiceInputController {
     }
 
     private func handleKeyEvent(_ event: NSEvent) {
-        let matchesKey = event.keyCode == hotkeyCode
-        let matchesMods = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
-            .contains(hotkeyModifiers)
-
-        if matchesKey && matchesMods && event.type == .keyDown {
+        if Self.matchesHotkey(keyCode: event.keyCode, modifiers: event.modifierFlags, isRepeat: event.isARepeat,
+                              hotkeyCode: hotkeyCode, hotkeyModifiers: hotkeyModifiers), event.type == .keyDown {
             // Toggle voice mode via notification
             NotificationCenter.default.post(name: .voiceToggleRequested, object: nil)
         }
+    }
+
+    /// The exact modifiers must match (⌘⌥Space is not ⌥Space), a held key's
+    /// auto-repeat doesn't toggle again, and a hotkey without a modifier
+    /// never fires (a bare Space would turn the assistant on while typing).
+    nonisolated static func matchesHotkey(
+        keyCode: UInt16,
+        modifiers: NSEvent.ModifierFlags,
+        isRepeat: Bool,
+        hotkeyCode: UInt16,
+        hotkeyModifiers: NSEvent.ModifierFlags
+    ) -> Bool {
+        let relevant: NSEvent.ModifierFlags = [.command, .option, .control, .shift]
+        guard !isRepeat, keyCode == hotkeyCode, !hotkeyModifiers.intersection(relevant).isEmpty else { return false }
+        return modifiers.intersection(relevant) == hotkeyModifiers.intersection(relevant)
     }
 
     // MARK: - Audio Capture
@@ -272,6 +297,7 @@ final class VoiceInputController {
         do {
             try session.start()
             self.captureSession = session
+            captureSampleRate = session.sampleRate
             Self.logger.info("Voice capture started")
         } catch {
             Self.logger.error("Failed to start voice capture: \(error)")

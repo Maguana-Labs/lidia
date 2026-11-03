@@ -2,14 +2,18 @@ import SwiftUI
 import SwiftData
 
 struct CalendarEventDetailView: View {
-    let event: GoogleCalendarClient.CalendarEvent
-    let onRecord: (String) -> Void
+    let event: AgendaEvent
+    /// Starts recording with the typed notes; `join` opens the call link first.
+    let onRecord: (_ notes: String, _ join: Bool) -> Void
     var onBack: (() -> Void)?
 
     @Environment(\.modelContext) private var modelContext
+    @Environment(RecordingSession.self) private var session
     @State private var notes = ""
     @State private var prepContext = ""
-    @State private var pendingItems: [(item: ActionItem, meetingTitle: String)] = []
+    /// Observed directly (not cached in state): an item deleted elsewhere (MCP inbox,
+    /// voice assistant, sync) leaves this query before the section can read it.
+    @Query(filter: #Predicate<ActionItem> { !$0.isCompleted }) private var openActionItems: [ActionItem]
     @State private var showAttendeesPopover = false
 
     private let relationshipStore = RelationshipStore()
@@ -35,7 +39,6 @@ struct CalendarEventDetailView: View {
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
         .onAppear {
             prepContext = relationshipStore.prepContext(for: event.attendees, modelContext: modelContext)
-            loadPendingActionItems()
         }
     }
 
@@ -47,7 +50,7 @@ struct CalendarEventDetailView: View {
                 Button {
                     onBack()
                 } label: {
-                    Label("Home", systemImage: "chevron.left")
+                    Label("Today", systemImage: "chevron.left")
                         .font(.subheadline)
                 }
                 .buttonStyle(.plain)
@@ -147,6 +150,8 @@ struct CalendarEventDetailView: View {
                         .background(.quaternary.opacity(0.5), in: Capsule())
                 }
                 .buttonStyle(.plain)
+                .accessibilityLabel("\(event.attendees.count) attendee\(event.attendees.count == 1 ? "" : "s")")
+                .accessibilityHint("Shows the attendee list")
                 .popover(isPresented: $showAttendeesPopover) {
                     VStack(alignment: .leading, spacing: 6) {
                         ForEach(event.attendees, id: \.self) { attendee in
@@ -154,6 +159,7 @@ struct CalendarEventDetailView: View {
                                 Image(systemName: "person.fill")
                                     .font(.caption)
                                     .foregroundStyle(.secondary)
+                                    .accessibilityHidden(true)
                                 Text(attendee)
                                     .font(.callout)
                             }
@@ -172,16 +178,14 @@ struct CalendarEventDetailView: View {
         } else if calendar.isDateInTomorrow(event.start) {
             return "Tomorrow"
         } else {
-            let formatter = DateFormatter()
-            formatter.dateFormat = "EEEE"
-            return formatter.string(from: event.start)
+            return event.start.formatted(.dateTime.weekday(.wide))
         }
     }
 
     private var timeRangeLabel: String {
-        let formatter = DateFormatter()
-        formatter.dateFormat = "HH:mm"
-        return "\(formatter.string(from: event.start)) – \(formatter.string(from: event.end))"
+        let start = event.start.formatted(date: .omitted, time: .shortened)
+        let end = event.end.formatted(date: .omitted, time: .shortened)
+        return "\(start) – \(end)"
     }
 
     private var attendeeChipLabel: String {
@@ -204,6 +208,7 @@ struct CalendarEventDetailView: View {
                     Image(systemName: "circle")
                         .font(.caption)
                         .foregroundStyle(.orange)
+                        .accessibilityHidden(true)
 
                     VStack(alignment: .leading, spacing: 2) {
                         Text(entry.item.title)
@@ -224,14 +229,9 @@ struct CalendarEventDetailView: View {
         }
     }
 
-    private func loadPendingActionItems() {
-        let descriptor = FetchDescriptor<ActionItem>(
-            predicate: #Predicate<ActionItem> { !$0.isCompleted }
-        )
-        guard let allOpen = try? modelContext.fetch(descriptor) else { return }
-
+    private var pendingItems: [(item: ActionItem, meetingTitle: String)] {
         let lowercasedAttendees = event.attendees.map { $0.lowercased() }
-        pendingItems = allOpen.compactMap { item in
+        return openActionItems.compactMap { item in
             guard let assignee = item.assignee?.lowercased(), !assignee.isEmpty else { return nil }
             let matches = lowercasedAttendees.contains { attendee in
                 attendee.contains(assignee) || assignee.contains(attendee)
@@ -276,24 +276,29 @@ struct CalendarEventDetailView: View {
 
     private var actionButtons: some View {
         HStack(spacing: 12) {
-            Button {
-                onRecord(notes)
-            } label: {
-                Label("Record", systemImage: "mic.fill")
-                    .frame(minWidth: 100)
-            }
-            .buttonStyle(.borderedProminent)
-            .tint(.red)
+            if session.isRecording {
+                Label("Another recording is in progress", systemImage: "record.circle")
+                    .foregroundStyle(.secondary)
+            } else {
+                if event.meetingLink != nil {
+                    Button {
+                        onRecord(notes, true)
+                    } label: {
+                        Label("Join & Record", systemImage: "video.fill")
+                            .frame(minWidth: 100)
+                    }
+                    .buttonStyle(.glassProminent)
+                    .help("Open the call and start recording")
+                }
 
-            if let link = event.meetingLink {
                 Button {
-                    NSWorkspace.shared.open(link)
-                    onRecord(notes)
+                    onRecord(notes, false)
                 } label: {
-                    Label("Join + Record", systemImage: "video.fill")
+                    Label("Record", systemImage: "record.circle")
                         .frame(minWidth: 80)
                 }
-                .buttonStyle(.bordered)
+                .buttonStyle(.glass)
+                .help("Start recording this meeting")
             }
         }
     }

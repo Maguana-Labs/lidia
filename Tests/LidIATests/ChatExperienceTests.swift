@@ -19,14 +19,15 @@ import Testing
     #expect(decoded.sourceMeetings == ["Weekly Sync"])
 }
 
-@Test func curatedModelListPrefersEfficientDefaults() {
+@Test func curatedModelListRanksLiveModelsByFamily() {
     let models = [
         "gpt-4o", "gpt-4o-mini", "o3-mini", "o4-mini", "gpt-5",
     ]
 
     let curated = ModelMenuCatalog.curatedModels(for: .openai, availableModels: models)
 
-    #expect(curated == ["gpt-4o-mini", "o4-mini", "o3-mini", "gpt-4o"])
+    // Family preference applied to the live list (no hard-coded IDs).
+    #expect(curated == ["gpt-5", "o4-mini", "o3-mini", "gpt-4o-mini", "gpt-4o"])
 }
 
 @Test @MainActor func threadTitleUsesFirstPrompt() {

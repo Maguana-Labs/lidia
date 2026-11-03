@@ -6,8 +6,7 @@ If you discover a security vulnerability in LidIA, please report it responsibly.
 
 ### How to Report
 
-1. **Preferred:** Use [GitHub's private vulnerability reporting](https://github.com/lidia-app/LidIA/security/advisories/new) to submit a report directly on this repository.
-2. **Email:** Send details to **julio@juliops.eu**.
+Use [GitHub's private vulnerability reporting](https://github.com/Maguana-Labs/lidia/security/advisories/new) to submit a report directly on this repository. Only the maintainers can see it.
 
 ### What to Include
 

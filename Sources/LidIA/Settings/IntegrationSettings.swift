@@ -42,7 +42,7 @@ final class IntegrationSettings {
     var slackChannel: String = "" {
         didSet { saveDefault(slackChannel, forKey: "slackChannel") }
     }
-    var slackAutoSend: Bool = true {
+    var slackAutoSend: Bool = false {
         didSet { saveDefault(slackAutoSend, forKey: "slackAutoSend") }
     }
     var slackSendSummary: Bool = true {
@@ -63,6 +63,17 @@ final class IntegrationSettings {
         didSet { saveDefault(clickUpListID, forKey: "clickUpListID") }
     }
 
+    // Linear
+    var linearAPIKey: String = "" {
+        didSet { SettingsKeychain.save(key: "lidia.linear.apiKey", value: linearAPIKey) }
+    }
+    var linearTeamID: String = "" {
+        didSet { saveDefault(linearTeamID, forKey: "linearTeamID") }
+    }
+    var linearTeamName: String = "" {
+        didSet { saveDefault(linearTeamName, forKey: "linearTeamName") }
+    }
+
     // Sync
     var syncEnabled: Bool = false {
         didSet { saveDefault(syncEnabled, forKey: "syncEnabled") }
@@ -75,10 +86,10 @@ final class IntegrationSettings {
     }
 
     // Integration auto-send
-    var notionAutoSend: Bool = true {
+    var notionAutoSend: Bool = false {
         didSet { saveDefault(notionAutoSend, forKey: "notionAutoSend") }
     }
-    var n8nAutoSend: Bool = true {
+    var n8nAutoSend: Bool = false {
         didSet { saveDefault(n8nAutoSend, forKey: "n8nAutoSend") }
     }
     var remindersAutoSend: Bool = true {
@@ -103,7 +114,7 @@ final class IntegrationSettings {
     var n8nSendAttendees: Bool = true {
         didSet { saveDefault(n8nSendAttendees, forKey: "n8nSendAttendees") }
     }
-    var n8nSendTranscript: Bool = true {
+    var n8nSendTranscript: Bool = false {
         didSet { saveDefault(n8nSendTranscript, forKey: "n8nSendTranscript") }
     }
 
@@ -148,6 +159,12 @@ final class IntegrationSettings {
         slackEnabled = defaults.bool(forKey: "slackEnabled")
         slackBotToken = SettingsKeychain.load(key: "lidia.slack.botToken") ?? ""
         slackChannel = defaults.string(forKey: "slackChannel") ?? ""
+        Self.migrateIntegrationDefaults(
+            in: defaults,
+            notionConfigured: !notionAPIKey.isEmpty && !notionDatabaseID.isEmpty,
+            n8nConfigured: n8nEnabled && !n8nWebhookURL.isEmpty,
+            slackConfigured: slackEnabled && !slackBotToken.isEmpty
+        )
         if let val = defaults.object(forKey: "slackAutoSend") as? Bool {
             slackAutoSend = val
         }
@@ -162,6 +179,9 @@ final class IntegrationSettings {
         }
         clickUpAPIKey = SettingsKeychain.load(key: "lidia.clickup.apiKey") ?? ""
         clickUpListID = defaults.string(forKey: "clickUpListID") ?? ""
+        linearAPIKey = SettingsKeychain.load(key: "lidia.linear.apiKey") ?? ""
+        linearTeamID = defaults.string(forKey: "linearTeamID") ?? ""
+        linearTeamName = defaults.string(forKey: "linearTeamName") ?? ""
         syncEnabled = defaults.bool(forKey: "syncEnabled")
         syncServerURL = defaults.string(forKey: "syncServerURL") ?? ""
         syncAuthToken = SettingsKeychain.load(key: "lidia.sync.authToken") ?? ""
@@ -201,6 +221,36 @@ final class IntegrationSettings {
             vaultExportPath = path
         }
         vaultExportIncludeTranscript = defaults.bool(forKey: "vaultExportIncludeTranscript")
+    }
+
+    // MARK: - Default Migration
+
+    static let integrationDefaultsVersionKey = "integrationDefaultsVersion"
+
+    /// Notion, n8n and Slack auto-send, and n8n's full transcript, used to
+    /// default to on and now default to off. Settings only persist once the
+    /// user flips them, so an existing user who set an integration up and
+    /// never touched these toggles has nothing stored and relies on the old
+    /// "on". For those users, pin the old value once so their workflow keeps
+    /// working; everyone else (and every new setup) gets the new off defaults.
+    /// Explicitly stored values are never changed.
+    static func migrateIntegrationDefaults(
+        in defaults: UserDefaults,
+        notionConfigured: Bool,
+        n8nConfigured: Bool,
+        slackConfigured: Bool
+    ) {
+        guard defaults.integer(forKey: integrationDefaultsVersionKey) < 1 else { return }
+        defer { defaults.set(1, forKey: integrationDefaultsVersionKey) }
+
+        func pinLegacyValue(_ key: String, if configured: Bool) {
+            guard configured, defaults.object(forKey: key) == nil else { return }
+            defaults.set(true, forKey: key)
+        }
+        pinLegacyValue("notionAutoSend", if: notionConfigured)
+        pinLegacyValue("n8nAutoSend", if: n8nConfigured)
+        pinLegacyValue("n8nSendTranscript", if: n8nConfigured)
+        pinLegacyValue("slackAutoSend", if: slackConfigured)
     }
 
     // MARK: - Persistence Helpers

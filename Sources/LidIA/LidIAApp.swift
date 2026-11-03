@@ -2,6 +2,7 @@ import AppKit
 import os
 import SwiftData
 import SwiftUI
+import LidIALiveActivity
 import UserNotifications
 
 private let appLogger = Logger(subsystem: "io.lidia.app", category: "LidIAApp")
@@ -93,7 +94,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         guard let session, let settings, let container = modelContainer else { return }
         guard !session.isRecording else { return }
 
-        let context = ModelContext(container)
+        // The main context, not a throwaway one: the meeting outlives this call (it is
+        // recorded, then processed), and a model whose context is freed traps when used.
+        let context = container.mainContext
         let meeting = session.startRecording(modelContext: context, settings: settings, meetingDetector: meetingDetectorRef, eventKitManager: eventKitManagerRef, googleCalendarMonitor: googleCalendarMonitorRef)
         if let eventTitle {
             meeting.title = eventTitle
@@ -119,14 +122,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
 @main
 struct LidIAApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) var appDelegate
-    @State private var session = RecordingSession()
+    // Made in `init` so Siri's intents (`MacSiriHost`) share them from launch.
+    @State private var session: RecordingSession
     @State private var queryService = MeetingQueryService()
-    @State private var eventKitManager = EventKitManager()
-    @State private var googleCalendarMonitor = GoogleCalendarMonitor()
-    @State private var settings = AppSettings()
+    @State private var eventKitManager: EventKitManager
+    @State private var googleCalendarMonitor: GoogleCalendarMonitor
+    @State private var settings: AppSettings
     @State private var menuBarController = MenuBarController()
-    @State private var meetingDetector = MeetingDetector()
-    @State private var modelManager = ModelManager()
+    @State private var meetingDetector: MeetingDetector
+    @State private var modelManager: ModelManager
     @State private var ttsModelManager = TTSModelManager()
     @State private var proactiveScheduler = ProactiveScheduler()
     @State private var voiceAssistant = VoiceAssistantService()
@@ -135,11 +139,38 @@ struct LidIAApp: App {
     @State private var updateController = UpdateController()
     @State private var proactiveInsights = ProactiveInsightsService()
     @State private var backgroundContext: ModelContext?
-    private let bannerController = MeetingDetectionBannerController()
     private let joinBannerController = MeetingJoinBannerController()
+
+    init() {
+        let session = RecordingSession()
+        let settings = AppSettings()
+        let eventKitManager = EventKitManager()
+        let googleCalendarMonitor = GoogleCalendarMonitor()
+        let meetingDetector = MeetingDetector()
+        let modelManager = ModelManager()
+        _session = State(initialValue: session)
+        _settings = State(initialValue: settings)
+        _eventKitManager = State(initialValue: eventKitManager)
+        _googleCalendarMonitor = State(initialValue: googleCalendarMonitor)
+        _meetingDetector = State(initialValue: meetingDetector)
+        _modelManager = State(initialValue: modelManager)
+        // Siri and Shortcuts: an intent can launch the app before any window
+        // exists, so the shared intents get the library and these objects now.
+        MacSiriHost.configure(MacSiriHost(
+            container: sharedModelContainer,
+            settings: settings,
+            session: session,
+            modelManager: modelManager,
+            meetingDetector: meetingDetector,
+            eventKitManager: eventKitManager,
+            googleCalendarMonitor: googleCalendarMonitor
+        ))
+    }
 
     var sharedModelContainer: ModelContainer = {
         let schema = Schema(versionedSchema: AppSchema.self)
+        // Demo and snapshot libraries never sync; the real library sets its mode below.
+        CloudSyncRuntime.shared.configure(mode: .off(.isolatedLibrary))
         // Demo mode: use in-memory store so real data is never touched
         if DemoDataSeeder.isDemoMode {
             let demoConfig = ModelConfiguration(schema: schema, isStoredInMemoryOnly: true)
@@ -149,49 +180,93 @@ struct LidIAApp: App {
                 fatalError("Demo mode ModelContainer failed: \(error)")
             }
         }
-        // CloudKit sync: change to .automatic after developer account verification + iCloud container setup
-        let config = ModelConfiguration(schema: schema, cloudKitDatabase: .none)
-        do {
-            return try ModelContainer(for: schema, configurations: [config])
-        } catch {
-            appLogger.error("ModelContainer failed: \(error). Attempting recovery without data loss...")
-
-            // Try once more — sometimes the retry alone succeeds after the OS clears locks
+        #if DEBUG
+        // Snapshot/design runs open a COPY of a library (never the real file).
+        // Without one they get an empty in-memory library.
+        if SnapshotRun.requiresIsolatedStore && SnapshotRun.storeOverrideURL == nil {
+            do {
+                return try ModelContainer(for: schema, configurations: [ModelConfiguration(schema: schema, isStoredInMemoryOnly: true)])
+            } catch {
+                fatalError("Snapshot in-memory ModelContainer failed: \(error)")
+            }
+        }
+        if let copyURL = SnapshotRun.storeOverrideURL {
+            let config = ModelConfiguration(schema: schema, url: copyURL, cloudKitDatabase: .none)
             do {
                 return try ModelContainer(for: schema, configurations: [config])
             } catch {
-                // Last resort: warn loudly and delete. This should be extremely rare.
-                appLogger.error("CRITICAL: ModelContainer failed twice. Deleting store as last resort: \(error)")
-                if let url = config.url as URL? {
-                    let fm = FileManager.default
-                    let related = [url, url.deletingPathExtension().appendingPathExtension("store-shm"),
-                                   url.deletingPathExtension().appendingPathExtension("store-wal")]
-                    for file in related { try? fm.removeItem(at: file) }
-                }
-                do {
-                    return try ModelContainer(for: schema, configurations: [config])
-                } catch {
-                    fatalError("FATAL: ModelContainer creation failed after store deletion: \(error)")
-                }
+                fatalError("LIDIA_STORE_URL could not be opened: \(error)")
             }
         }
+        #endif
+        // LidIA's own folder, not SwiftData's default URL, which other apps share.
+        try? FileManager.default.createDirectory(at: LibraryLocation.folder, withIntermediateDirectories: true)
+        LibraryLocation.migrateLegacyStoreIfNeeded()
+
+        // iCloud sync (private database, the user's own account). Decided before opening:
+        // on for new installs, asked once for an existing library, off in Local-only mode
+        // and in builds without the iCloud entitlement.
+        let libraryExists = FileManager.default.fileExists(atPath: LibraryLocation.storeURL.path)
+        let choice = CloudSyncPreference.resolveAtLaunch(libraryExists: libraryExists)
+        let wanted = LibrarySyncMode.resolve(
+            isolatedLibrary: false,
+            entitled: CloudKitEntitlement.isPresent,
+            localOnly: PrivacyGate.isLocalOnly,
+            preference: choice
+        )
+        // Never-pruned backups before the schema upgrade and before the first iCloud sync.
+        let prepared = LibraryMilestoneBackups.prepare(
+            mode: wanted, storeURL: LibraryLocation.storeURL, backupsRoot: LibraryLocation.backupsRoot
+        )
+        var mode = prepared.mode
+        var syncProblem = prepared.problem
+
+        let localConfig = ModelConfiguration(schema: schema, url: LibraryLocation.storeURL, cloudKitDatabase: .none)
+        let syncedConfig = ModelConfiguration(schema: schema, url: LibraryLocation.storeURL, cloudKitDatabase: mode.cloudKitDatabase)
+        // Never deletes the store: daily rolling backup, and on repeated open failure the
+        // store is moved to a timestamped backup folder and a notice is recorded for the UI
+        // (`LibraryHealth.shared.recoveryNotice`).
+        let result = StoreGuardian.openContainer(
+            storeURL: localConfig.url,
+            backupsRoot: LibraryLocation.backupsRoot,
+            open: { _ in
+                if mode.isICloud {
+                    do {
+                        return try ModelContainer(for: schema, configurations: [syncedConfig])
+                    } catch {
+                        // Not a library problem: open it without sync and say why in Settings.
+                        appLogger.error("Opening the library with iCloud sync failed: \(error, privacy: .public)")
+                        mode = .off(.turnedOff)
+                        syncProblem = "iCloud sync couldn't start (\(error.localizedDescription)). Your library opened on this Mac only."
+                    }
+                }
+                return try ModelContainer(for: schema, configurations: [localConfig])
+            },
+            openInMemory: {
+                try ModelContainer(for: schema, configurations: [ModelConfiguration(schema: schema, isStoredInMemoryOnly: true)])
+            }
+        )
+        if let notice = result.notice {
+            appLogger.error("Library recovered; previous library backed up to \(notice.backupPath, privacy: .public)")
+            StoreGuardian.saveNotice(notice)
+            // A temporary in-memory library never syncs. (A fresh library that replaced a
+            // corrupt one opened with `mode`, and refills from iCloud when syncing.)
+            if notice.isTemporaryLibrary { mode = .off(.isolatedLibrary) }
+        }
+        // Meetings already in the library were made on this Mac: claim them before launch
+        // recovery runs and before other devices' meetings arrive. Not on a temporary
+        // library, or the one-time claim would be spent on nothing.
+        if result.notice?.isTemporaryLibrary != true {
+            LegacyMeetingOwnership.claimOnce(in: result.container.mainContext)
+        }
+        CloudSyncRuntime.shared.configure(mode: mode, startupError: syncProblem)
+        return result.container
     }()
 
     var body: some Scene {
         WindowGroup {
             ContentView()
-                .environment(session)
-                .environment(queryService)
-                .environment(eventKitManager)
-                .environment(googleCalendarMonitor)
-                .environment(settings)
-                .environment(meetingDetector)
-                .environment(modelManager)
-                .environment(proactiveScheduler)
-                .environment(voiceAssistant)
-                .environment(syncManager)
-                .environment(updateController)
-                .environment(\.backgroundContext, backgroundContext)
+                .injectAppEnvironment(appEnvironment)
                 .preferredColorScheme(settings.appearanceMode.colorScheme)
                 .onAppear {
                     if backgroundContext == nil {
@@ -200,19 +275,9 @@ struct LidIAApp: App {
                         backgroundContext = ctx
                     }
 
-                    // Recovery: reset any meetings stuck in .processing from a previous crash
-                    let ctx = sharedModelContainer.mainContext
-                    let allMeetings = (try? ctx.fetch(FetchDescriptor<Meeting>())) ?? []
-                    for meeting in allMeetings where meeting.status == .processing {
-                        appLogger.warning("Recovering stuck meeting: \(meeting.title)")
-                        if meeting.rawTranscript.isEmpty {
-                            meeting.status = .failed
-                            meeting.processingError = "Processing was interrupted. Use Regenerate to retry."
-                        } else {
-                            meeting.status = .queued
-                        }
-                    }
-                    try? ctx.save()
+                    // Recovery: re-queue meetings interrupted mid-processing by a crash
+                    // (the drain loop picks them up), fail empty ones with a clear message.
+                    ProcessingRecovery.recoverOnceAtLaunch(in: sharedModelContainer.mainContext)
 
                     // Demo mode: seed with realistic dummy data for screenshots
                  if DemoDataSeeder.isDemoMode {
@@ -234,17 +299,24 @@ struct LidIAApp: App {
                     eventKitManager.backgroundContext = backgroundContext
 
                     menuBarController.setup(
-                        session: session,
-                        eventKitManager: eventKitManager,
-                        googleCalendarMonitor: googleCalendarMonitor,
-                        meetingDetector: meetingDetector,
-                        settings: settings,
-                        modelContainer: sharedModelContainer,
-                        updateController: updateController
+                        environment: appEnvironment,
+                        modelContainer: sharedModelContainer
                     )
+                    // A snapshot run only renders the window: no calendar sync,
+                    // notifications, AI insights, sync, meeting detection or model loading.
+                    guard !SnapshotRun.isActive else {
+                        MainWindowSnapshotter.installIfRequested(settings: settings, calendar: googleCalendarMonitor)
+                        #if DEBUG
+                        MenuBarSnapshotter.installIfRequested(menuBar: menuBarController, session: session)
+                        #endif
+                        return
+                    }
                     if !DemoDataSeeder.isDemoMode {
                         googleCalendarMonitor.configure(settings: settings)
                     }
+                    // iCloud sync status (account, last sync, errors) for Settings.
+                    CloudSyncRuntime.shared.start()
+
                     proactiveScheduler.configure(
                         settings: settings,
                         calendarMonitor: googleCalendarMonitor,
@@ -273,6 +345,11 @@ struct LidIAApp: App {
                         voiceAssistant?.onUserFinishedSpeaking()
                     }
 
+                    // Dictation everywhere (off until turned on in Settings › Dictation).
+                    if !DemoDataSeeder.isDemoMode {
+                        DictationController.shared.configure(settings: settings, modelManager: modelManager)
+                    }
+
                     syncManager.configure(settings: settings, modelContext: backgroundContext!)
 
                     // Warm keepalive: auto-load last-used MLX model on launch
@@ -281,6 +358,9 @@ struct LidIAApp: App {
                     }
                     modelManager.startMemoryPressureMonitoring()
 
+                    meetingDetector.calendarMeetingNow = { [googleCalendarMonitor, eventKitManager, settings] in
+                        currentCalendarMeetingTitle(googleCalendarMonitor: googleCalendarMonitor, eventKitManager: eventKitManager, userName: settings.displayName)
+                    }
                     if settings.autoDetectMeetings {
                         meetingDetector.startMonitoring()
                     }
@@ -290,7 +370,7 @@ struct LidIAApp: App {
                         meetingDetector.startMonitoring()
                     } else {
                         meetingDetector.stopMonitoring()
-                        bannerController.close()
+                        menuBarController.closeMeetingDetected()
                     }
                 }
                 .onChange(of: meetingDetector.detectedApp?.bundleID) { _, _ in
@@ -325,6 +405,10 @@ struct LidIAApp: App {
                 .onChange(of: settings.syncAuthToken) { _, _ in
                     syncManager.configure(settings: settings, modelContext: backgroundContext!)
                 }
+                .onChange(of: settings.localOnlyMode) { _, _ in
+                    // On: stop sync now. Off: resume it without a relaunch.
+                    syncManager.configure(settings: settings, modelContext: backgroundContext!)
+                }
                 .onReceive(NotificationCenter.default.publisher(for: .meetingDidFinishProcessing)) { notification in
                     if let meeting = notification.object as? Meeting {
                         syncManager.pushMeeting(meeting)
@@ -333,20 +417,39 @@ struct LidIAApp: App {
         }
         .modelContainer(sharedModelContainer)
         .windowStyle(.automatic)
+        .commands { AppCommands() }
+
+        #if DEBUG
+        let _ = SettingsSnapshotter.installIfRequested(settings: settings)
+        #endif
 
         Settings {
             SettingsView(settings: settings)
-                .environment(settings)
-                .environment(googleCalendarMonitor)
-                .environment(modelManager)
-                .environment(ttsModelManager)
-                .environment(proactiveScheduler)
-                .environment(voiceAssistant)
-                .environment(syncManager)
+                .injectAppEnvironment(appEnvironment)
                 .modelContainer(sharedModelContainer)
-                .frame(width: 720, height: 580)
+                .preferredColorScheme(settings.appearanceMode.colorScheme)
         }
-        .windowResizability(.contentSize)
+        .defaultSize(width: 860, height: 640)
+        .windowResizability(.contentMinSize)
+    }
+
+    /// The shared objects every root injects (`injectAppEnvironment`).
+    private var appEnvironment: AppEnvironment {
+        AppEnvironment(
+            session: session,
+            queryService: queryService,
+            eventKitManager: eventKitManager,
+            googleCalendarMonitor: googleCalendarMonitor,
+            settings: settings,
+            meetingDetector: meetingDetector,
+            modelManager: modelManager,
+            ttsModelManager: ttsModelManager,
+            proactiveScheduler: proactiveScheduler,
+            voiceAssistant: voiceAssistant,
+            syncManager: syncManager,
+            updateController: updateController,
+            backgroundContext: backgroundContext
+        )
     }
 
     private func handlePendingBanner(_ pending: PendingMeetingBanner?) {
@@ -380,55 +483,62 @@ struct LidIAApp: App {
         )
     }
 
+    /// "Zoom call started" under the menu bar icon (the top-right banner when the icon
+    /// can't be seen). It goes away when the app releases the mic: the detector clears
+    /// `detectedApp`, which runs this again.
     private func handleMeetingDetection() {
         guard settings.autoDetectMeetings,
               !session.isRecording,
               !meetingDetector.isDismissed,
               let detected = meetingDetector.detectedApp else {
-            bannerController.close()
+            menuBarController.closeMeetingDetected()
             return
         }
 
-        bannerController.show(appName: detected.name) { [session, settings, backgroundContext, meetingDetector, googleCalendarMonitor, eventKitManager] in
-            guard !session.isRecording, let bgCtx = backgroundContext else { return }
-            let meeting = session.startRecording(modelContext: bgCtx, settings: settings, meetingDetector: meetingDetector, eventKitManager: eventKitManager, googleCalendarMonitor: googleCalendarMonitor)
-
-            // Try to match a calendar event happening now
-            if let matchingEvent = findCurrentCalendarEvent(
-                googleCalendarMonitor: googleCalendarMonitor
-            ) {
-                meeting.title = matchingEvent.title
-                meeting.calendarEventID = matchingEvent.id
-                meeting.calendarAttendees = matchingEvent.attendees
-            } else {
-                meeting.title = "Meeting — \(detected.name)"
+        let state = MeetingDetectedActivityState(
+            meetingName: detected.name,
+            appName: MeetingDetectionBannerView.appName(bundleID: detected.bundleID),
+            bundleID: detected.bundleID,
+            calendarTitle: meetingDetector.calendarMeetingNow(),
+            detectedAt: .now
+        )
+        menuBarController.showMeetingDetected(state, actions: MeetingDetectedActions(
+            record: { [session, settings, backgroundContext, meetingDetector, googleCalendarMonitor, eventKitManager] in
+                guard !session.isRecording, let bgCtx = backgroundContext else { return }
+                // Matches the calendar meeting on now, if any; otherwise the title comes
+                // from the AI notes (not "Meeting — Zoom").
+                _ = session.startRecording(modelContext: bgCtx, settings: settings, meetingDetector: meetingDetector, eventKitManager: eventKitManager, googleCalendarMonitor: googleCalendarMonitor)
+                meetingDetector.dismiss()
+            },
+            notNow: { [meetingDetector] in
+                meetingDetector.dismiss()
+            },
+            never: { [meetingDetector] in
+                meetingDetector.neverDetect(bundleID: detected.bundleID)
             }
-            meetingDetector.dismiss()
-        }
+        ))
     }
 
-    /// Finds a calendar event that is currently happening (within its start/end window).
-    private func findCurrentCalendarEvent(
-        googleCalendarMonitor: GoogleCalendarMonitor
-    ) -> (title: String, id: String, attendees: [String])? {
-        let now = Date()
+}
 
-        // Check Google Calendar events first
-        if googleCalendarMonitor.isSignedIn {
-            for event in googleCalendarMonitor.upcomingEvents {
-                if event.start <= now && event.end >= now {
-                    return (title: event.title, id: event.id, attendees: event.attendees)
-                }
-            }
+/// Title of a calendar meeting (others invited or a call link) on now or about to start,
+/// for meeting detection.
+@MainActor
+func currentCalendarMeetingTitle(
+    googleCalendarMonitor: GoogleCalendarMonitor,
+    eventKitManager: EventKitManager,
+    userName: String
+) -> String? {
+    var candidates: [RecordingCalendarMatch.Candidate] = []
+    if googleCalendarMonitor.isSignedIn {
+        candidates += googleCalendarMonitor.weekEvents.map {
+            .init(id: $0.id, title: $0.title, start: $0.start, end: $0.end, attendees: $0.attendees, hasMeetingLink: $0.meetingLink != nil)
         }
-
-        // Fall back to Apple Calendar events
-        for event in eventKitManager.upcomingEvents {
-            if event.start <= now && event.end >= now {
-                return (title: event.title, id: event.id, attendees: event.attendees)
-            }
-        }
-
-        return nil
     }
+    candidates += eventKitManager.upcomingEvents.map {
+        .init(id: $0.id, title: $0.title, start: $0.start, end: $0.end, attendees: $0.attendees, hasMeetingLink: $0.meetingLink != nil)
+    }
+    // On now, or starting in the next 5 minutes.
+    let now = Date()
+    return RecordingCalendarMatch.pick(candidates.filter { $0.start <= now.addingTimeInterval(5 * 60) }, now: now, currentUserName: userName)?.title
 }

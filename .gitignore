@@ -1,6 +1,5 @@
 .DS_Store
-/.build
-/Packages
+.build/
 xcuserdata/
 DerivedData/
 .swiftpm/xcode/package.xcworkspace/contents.xcworkspacedata
@@ -21,3 +20,6 @@ docs/plans/
 .claude/settings.local.json
 .claude/plans/
 .claude/worktrees/
+
+# Local signing (your Apple Developer team); see Config/Local.xcconfig.example
+Config/Local.xcconfig

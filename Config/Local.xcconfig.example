@@ -1,0 +1,4 @@
+// Copy to Config/Local.xcconfig (gitignored) and set your Apple Developer Team ID
+// (developer.apple.com/account › Membership Details). scripts/fetch-icloud-profile.sh
+// reads it too.
+DEVELOPMENT_TEAM = ABCDE12345

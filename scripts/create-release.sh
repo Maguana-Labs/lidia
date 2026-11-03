@@ -1,229 +1,283 @@
 #!/bin/bash
-# Create a distributable release of LidIA (.zip + .dmg)
-# Signs with Developer ID and notarizes with Apple.
+# Build, sign, notarize and (optionally) publish a LidIA release.
 #
 # Usage:
-#   ./scripts/create-release.sh              # Build + create artifacts (ad-hoc sign)
-#   ./scripts/create-release.sh v0.1.0       # Same, with version tag
-#   ./scripts/create-release.sh v0.1.0 sign  # Build + sign with Developer ID + notarize
+#   ./scripts/create-release.sh 1.2.0              # Developer ID + notarized DMG and signed appcast in dist/
+#   ./scripts/create-release.sh 1.2.0 --publish    # same, then a GitHub release with the DMG and appcast
+#   ./scripts/create-release.sh 1.2.0 --adhoc      # local test build: ad-hoc signed, not notarized
+#   ./scripts/create-release.sh 1.2.0 --no-icloud  # Developer ID build without iCloud sync
 #
-# Prerequisites for signed releases:
-#   1. "Developer ID Application" certificate in Keychain
-#   2. App-specific password stored: xcrun notarytool store-credentials "LidIA-notary"
-#      (prompts for Apple ID, Team ID, and app-specific password)
+# One-time setup (see docs/release-signing.md and docs/icloud-sync.md):
+#   1. A "Developer ID Application" certificate in this Mac's Keychain.
+#   2. Notary credentials: xcrun notarytool store-credentials "LidIA-notary"
+#   3. The Sparkle private key in this Mac's Keychain (generate_keys).
+#   4. A Developer ID provisioning profile for io.lidia.app with iCloud
+#      (scripts/fetch-icloud-profile.sh developer-id finds or makes it), and the
+#      CloudKit schema deployed to Production in the CloudKit Console.
 #
-# Output: dist/LidIA-<version>.zip and dist/LidIA-<version>.dmg
+# Updates are served from GitHub releases of $LIDIA_RELEASE_REPO (default
+# Maguana-Labs/lidia). The app's SUFeedURL points at
+# https://github.com/<repo>/releases/latest/download/appcast.xml, so each
+# release carries its own signed appcast.
 
 set -euo pipefail
 
-VERSION="${1:-$(git describe --tags --always 2>/dev/null || echo "dev")}"
-SIGN_MODE="${2:-adhoc}"  # "sign" for Developer ID + notarization, anything else for ad-hoc
+usage() { sed -n '2,9p' "$0" | sed 's/^# \{0,1\}//'; exit 1; }
+
+VERSION="${1:-}"; [ -n "${VERSION}" ] || usage
+VERSION="${VERSION#v}"
+shift
+MODE="sign"
+PUBLISH=0
+ICLOUD=1
+for arg in "$@"; do
+    case "$arg" in
+        --adhoc) MODE="adhoc" ;;
+        --publish) PUBLISH=1 ;;
+        --no-icloud) ICLOUD=0 ;;
+        *) usage ;;
+    esac
+done
+# Ad-hoc signatures can't carry a provisioning profile, so they never get iCloud.
+[ "${MODE}" = "adhoc" ] && ICLOUD=0
+if [ "${MODE}" = "adhoc" ] && [ "${PUBLISH}" = 1 ]; then
+    echo "ERROR: --publish needs a signed, notarized build (drop --adhoc)." >&2
+    exit 1
+fi
+
 ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 DIST_DIR="${ROOT_DIR}/dist"
 APP_NAME="LidIA"
 ENTITLEMENTS="${ROOT_DIR}/Sources/LidIA/Resources/LidIA.entitlements"
+PLIST_SRC="${ROOT_DIR}/Sources/LidIA/Resources/Info.plist"
+NOTARY_PROFILE="${LIDIA_NOTARY_PROFILE:-LidIA-notary}"
+RELEASE_REPO="${LIDIA_RELEASE_REPO:-Maguana-Labs/lidia}"
+SPARKLE_BIN="${ROOT_DIR}/.build/artifacts/sparkle/Sparkle/bin"
+# Monotonic build number for Sparkle's version comparison.
+BUILD_NUMBER="$(git -C "${ROOT_DIR}" rev-list --count HEAD)"
 
-echo "==> Building ${APP_NAME} release ${VERSION}..."
-echo ""
+step() { echo ""; echo "==> $*"; }
+fail() { echo "ERROR: $*" >&2; exit 1; }
 
-# 1. Build in release mode
-echo "==> Step 1/7: Building release binary..."
+# ---------------------------------------------------------------- preflight
+step "Preflight (${MODE}, version ${VERSION}, build ${BUILD_NUMBER})"
+SU_KEY="$(/usr/libexec/PlistBuddy -c 'Print :SUPublicEDKey' "${PLIST_SRC}" 2>/dev/null || true)"
+if [ -z "${SU_KEY}" ] || [ "${SU_KEY}" = "REPLACE_WITH_SPARKLE_PUBLIC_ED_KEY" ]; then
+    [ "${MODE}" = "sign" ] && fail "SUPublicEDKey is missing or the placeholder. See docs/release-signing.md."
+    echo "WARNING: SUPublicEDKey is a placeholder; in-app updates are off in this build."
+fi
+
+if [ "${MODE}" = "sign" ]; then
+    DEV_ID="$(security find-identity -v -p codesigning 2>/dev/null | grep '"Developer ID Application' | head -1 | sed 's/.*"\(.*\)"/\1/' || true)"
+    [ -n "${DEV_ID}" ] || fail "No 'Developer ID Application' certificate in the Keychain. See docs/release-signing.md, step 1."
+    xcrun notarytool history --keychain-profile "${NOTARY_PROFILE}" >/dev/null 2>&1 \
+        || fail "Notary credentials '${NOTARY_PROFILE}' not found. Run: xcrun notarytool store-credentials \"${NOTARY_PROFILE}\""
+    [ "$("${SPARKLE_BIN}/generate_keys" -p 2>/dev/null)" = "${SU_KEY}" ] \
+        || fail "The Sparkle private key in this Keychain doesn't match SUPublicEDKey in Info.plist."
+    if [ "${PUBLISH}" = 1 ]; then
+        gh repo view "${RELEASE_REPO}" >/dev/null 2>&1 || fail "Can't reach GitHub repo ${RELEASE_REPO} with gh."
+        if gh release view "v${VERSION}" --repo "${RELEASE_REPO}" >/dev/null 2>&1; then
+            fail "Release v${VERSION} already exists in ${RELEASE_REPO}."
+        fi
+    fi
+    SIGN_ID="${DEV_ID}"
+    echo "    Identity: ${DEV_ID}"
+    if [ "${ICLOUD}" = 1 ]; then
+        # iCloud outside the App Store needs a Developer ID profile with iCloud embedded.
+        ICLOUD_PROFILE="$("${ROOT_DIR}/scripts/fetch-icloud-profile.sh" developer-id)" \
+            || fail "No Developer ID provisioning profile with iCloud for io.lidia.app (steps above), or pass --no-icloud."
+        echo "    iCloud profile: ${ICLOUD_PROFILE}"
+        echo "    Reminder: the CloudKit schema must be deployed to Production (docs/icloud-sync.md) or releases can't sync."
+    fi
+else
+    SIGN_ID="-"
+fi
+
+# ---------------------------------------------------------------- build
+step "Building release binaries"
 cd "${ROOT_DIR}"
-swift build -c release
-
+swift build -c release --product LidIA
+swift build -c release --product LidiaMCP
 BIN_PATH="$(swift build -c release --show-bin-path)"
 
-# 2. Create .app bundle
-echo "==> Step 2/7: Packaging .app bundle..."
+# ---------------------------------------------------------------- package
+step "Packaging ${APP_NAME}.app"
+mkdir -p "${DIST_DIR}"
 RELEASE_APP="${DIST_DIR}/${APP_NAME}.app"
 CONTENTS="${RELEASE_APP}/Contents"
 MACOS="${CONTENTS}/MacOS"
 RESOURCES="${CONTENTS}/Resources"
 FRAMEWORKS="${CONTENTS}/Frameworks"
-
 rm -rf "${RELEASE_APP}"
-mkdir -p "${MACOS}" "${RESOURCES}" "${FRAMEWORKS}" "${DIST_DIR}"
+mkdir -p "${MACOS}" "${RESOURCES}" "${FRAMEWORKS}"
 
-# Copy release executable
 cp "${BIN_PATH}/LidIA" "${MACOS}/LidIA"
+cp "${BIN_PATH}/LidiaMCP" "${MACOS}/LidiaMCP"
 
-# Copy Info.plist and set version
-cp "${ROOT_DIR}/Sources/LidIA/Resources/Info.plist" "${CONTENTS}/Info.plist"
-/usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString ${VERSION}" "${CONTENTS}/Info.plist" 2>/dev/null || \
-    /usr/libexec/PlistBuddy -c "Add :CFBundleShortVersionString string ${VERSION}" "${CONTENTS}/Info.plist"
-/usr/libexec/PlistBuddy -c "Set :CFBundleVersion ${VERSION}" "${CONTENTS}/Info.plist" 2>/dev/null || \
-    /usr/libexec/PlistBuddy -c "Add :CFBundleVersion string ${VERSION}" "${CONTENTS}/Info.plist"
+cp "${PLIST_SRC}" "${CONTENTS}/Info.plist"
+/usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString ${VERSION}" "${CONTENTS}/Info.plist"
+/usr/libexec/PlistBuddy -c "Set :CFBundleVersion ${BUILD_NUMBER}" "${CONTENTS}/Info.plist"
+if [ -n "${LIDIA_GOOGLE_CLIENT_ID:-}" ]; then
+    /usr/libexec/PlistBuddy -c "Set :LidIAGoogleClientID ${LIDIA_GOOGLE_CLIENT_ID}" "${CONTENTS}/Info.plist"
+    /usr/libexec/PlistBuddy -c "Set :LidIAGoogleClientSecret ${LIDIA_GOOGLE_CLIENT_SECRET:-}" "${CONTENTS}/Info.plist"
+fi
 
-# Compile asset catalog
 XCASSETS_SRC="${ROOT_DIR}/Sources/LidIA/Resources/Assets.xcassets"
 if [ -d "${XCASSETS_SRC}" ]; then
-    echo "    Compiling asset catalog..."
-    xcrun actool "${XCASSETS_SRC}" \
-        --compile "${RESOURCES}" \
-        --platform macosx \
-        --minimum-deployment-target 15.0 \
-        --app-icon AppIcon \
-        --output-partial-info-plist /dev/null \
-        2>/dev/null || true
+    xcrun actool "${XCASSETS_SRC}" --compile "${RESOURCES}" --platform macosx \
+        --minimum-deployment-target 26.0 --app-icon AppIcon \
+        --output-partial-info-plist /dev/null >/dev/null
 fi
-
-# Copy hand-crafted .icns
 ICNS_SRC="${ROOT_DIR}/Sources/LidIA/Resources/AppIcon.icns"
-if [ -f "${ICNS_SRC}" ]; then
-    cp "${ICNS_SRC}" "${RESOURCES}/AppIcon.icns"
-fi
+[ -f "${ICNS_SRC}" ] && cp "${ICNS_SRC}" "${RESOURCES}/AppIcon.icns"
 
-# Copy SPM resource bundle
-ASSETS_BUNDLE="${BIN_PATH}/LidIA_LidIA.bundle"
-if [ -d "${ASSETS_BUNDLE}" ]; then
-    cp -R "${ASSETS_BUNDLE}" "${RESOURCES}/"
-fi
+# SPM resource bundles (LidIA's own and every dependency's).
+find "${BIN_PATH}" -maxdepth 1 -name "*.bundle" -exec cp -R {} "${RESOURCES}/" \;
 
-# Compile MLX Metal shaders
+# MLX Metal shaders: SPM doesn't compile them, so build the metallib here.
 MLX_METAL_DIR="${ROOT_DIR}/.build/checkouts/mlx-swift/Source/Cmlx/mlx-generated/metal"
-MLX_BUNDLE="${RESOURCES}/mlx-swift_Cmlx.bundle"
 if [ -d "${MLX_METAL_DIR}" ]; then
-    MLX_METALLIB="${MLX_BUNDLE}/default.metallib"
-    echo "    Compiling MLX Metal shaders..."
+    MLX_BUNDLE="${RESOURCES}/mlx-swift_Cmlx.bundle"
     mkdir -p "${MLX_BUNDLE}"
-    AIR_DIR=$(mktemp -d)
-    find "${MLX_METAL_DIR}" -name "*.metal" -print0 | while IFS= read -r -d '' f; do
-        name=$(basename "$f" .metal)
-        xcrun -sdk macosx metal -c -I "${MLX_METAL_DIR}" "$f" -o "${AIR_DIR}/${name}.air" 2>/dev/null
-    done
-    xcrun -sdk macosx metallib "${AIR_DIR}"/*.air -o "${MLX_METALLIB}" 2>/dev/null
+    AIR_DIR="$(mktemp -d)"
+    while IFS= read -r -d '' f; do
+        xcrun -sdk macosx metal -c -I "${MLX_METAL_DIR}" "$f" -o "${AIR_DIR}/$(basename "$f" .metal).air"
+    done < <(find "${MLX_METAL_DIR}" -name "*.metal" -print0)
+    xcrun -sdk macosx metallib "${AIR_DIR}"/*.air -o "${MLX_BUNDLE}/default.metallib"
     rm -rf "${AIR_DIR}"
-    echo "    MLX metallib: $(du -h "${MLX_METALLIB}" | cut -f1)"
+    echo "    MLX metallib: $(du -h "${MLX_BUNDLE}/default.metallib" | cut -f1)"
 fi
 
-# Embed Sparkle.framework
+# Sparkle: the native build system puts package frameworks in PackageFrameworks/.
 SPARKLE_FW="${BIN_PATH}/Sparkle.framework"
-if [ -d "${SPARKLE_FW}" ]; then
-    echo "    Embedding Sparkle.framework..."
-    cp -R "${SPARKLE_FW}" "${FRAMEWORKS}/"
-    install_name_tool -add_rpath "@executable_path/../Frameworks" "${MACOS}/LidIA" 2>/dev/null || true
+[ -d "${SPARKLE_FW}" ] || SPARKLE_FW="${BIN_PATH}/PackageFrameworks/Sparkle.framework"
+[ -d "${SPARKLE_FW}" ] || fail "Sparkle.framework not found under ${BIN_PATH}."
+cp -R "${SPARKLE_FW}" "${FRAMEWORKS}/"
+if ! otool -l "${MACOS}/LidIA" | grep -q "@executable_path/../Frameworks"; then
+    install_name_tool -add_rpath "@executable_path/../Frameworks" "${MACOS}/LidIA"
 fi
 
-# Copy LidiaMCP if exists
-if [ -f "${BIN_PATH}/LidiaMCP" ]; then
-    cp "${BIN_PATH}/LidiaMCP" "${MACOS}/LidiaMCP"
-fi
+# App Intents metadata: without it macOS sees no Siri or Shortcuts actions.
+# shellcheck source=scripts/lib/appintents-metadata.sh
+source "${ROOT_DIR}/scripts/lib/appintents-metadata.sh"
+build_appintents_metadata Release "${RELEASE_APP}" || fail "App Intents metadata failed (see above)."
 
-# 3. Code sign
-if [ "${SIGN_MODE}" = "sign" ]; then
-    echo "==> Step 3/7: Code signing with Developer ID..."
-
-    # Find Developer ID Application identity
-    DEV_ID=$(security find-identity -v -p codesigning 2>/dev/null | grep "Developer ID Application" | head -1 | sed 's/.*"\(.*\)"/\1/' || echo "")
-    if [ -z "${DEV_ID}" ]; then
-        echo "ERROR: No 'Developer ID Application' certificate found in Keychain."
-        echo ""
-        echo "To create one:"
-        echo "  1. Go to https://developer.apple.com/account/resources/certificates"
-        echo "  2. Create a 'Developer ID Application' certificate"
-        echo "  3. Download and double-click to install in Keychain"
-        exit 1
-    fi
-
-    echo "    Identity: ${DEV_ID}"
-
-    # Sign embedded frameworks first
-    if [ -d "${FRAMEWORKS}" ]; then
-        find "${FRAMEWORKS}" -name "*.framework" -exec \
-            codesign --force --sign "${DEV_ID}" --options runtime {} \; 2>/dev/null || true
-    fi
-
-    # Sign the app with hardened runtime (required for notarization)
-    codesign --force --sign "${DEV_ID}" \
-        --entitlements "${ENTITLEMENTS}" \
-        --options runtime \
-        --generate-entitlement-der \
-        "${RELEASE_APP}"
-
-    echo "    Signed successfully"
-else
-    echo "==> Step 3/7: Code signing (ad-hoc — not notarizable)..."
-    if [ -d "${FRAMEWORKS}" ]; then
-        find "${FRAMEWORKS}" -name "*.framework" -exec codesign --force --sign - {} \; 2>/dev/null || true
-    fi
-    codesign --force --sign - --entitlements "${ENTITLEMENTS}" "${RELEASE_APP}"
-fi
-
-# 4. Create .zip (Sparkle uses zip for updates)
-echo "==> Step 4/7: Creating ZIP archive..."
-ZIP_NAME="${APP_NAME}-${VERSION}.zip"
-cd "${DIST_DIR}"
-rm -f "${ZIP_NAME}"
-ditto -c -k --keepParent "${APP_NAME}.app" "${ZIP_NAME}"
-echo "    Created: dist/${ZIP_NAME} ($(du -h "${ZIP_NAME}" | cut -f1))"
-
-# 5. Create .dmg
-echo "==> Step 5/7: Creating DMG..."
-DMG_NAME="${APP_NAME}-${VERSION}.dmg"
-rm -f "${DMG_NAME}"
-
-DMG_STAGE=$(mktemp -d)
-cp -R "${APP_NAME}.app" "${DMG_STAGE}/"
-ln -s /Applications "${DMG_STAGE}/Applications"
-
-hdiutil create -volname "${APP_NAME}" \
-    -srcfolder "${DMG_STAGE}" \
-    -ov -format UDZO \
-    "${DMG_NAME}" \
-    -quiet
-
-rm -rf "${DMG_STAGE}"
-echo "    Created: dist/${DMG_NAME} ($(du -h "${DMG_NAME}" | cut -f1))"
-
-# 6. Notarize (only if signed with Developer ID)
-if [ "${SIGN_MODE}" = "sign" ]; then
-    echo "==> Step 6/7: Notarizing with Apple..."
-    echo "    Submitting DMG for notarization..."
-
-    if xcrun notarytool submit "${DMG_NAME}" \
-        --keychain-profile "LidIA-notary" \
-        --wait 2>&1; then
-        echo "    Notarization succeeded!"
-
-        echo "    Stapling notarization ticket..."
-        xcrun stapler staple "${DMG_NAME}"
-        echo "    DMG stapled successfully"
-
-        # Also notarize the ZIP
-        echo "    Submitting ZIP for notarization..."
-        xcrun notarytool submit "${ZIP_NAME}" \
-            --keychain-profile "LidIA-notary" \
-            --wait 2>&1 || echo "    ZIP notarization failed (non-critical, DMG is primary)"
+# ---------------------------------------------------------------- sign
+step "Signing (inside out)"
+sign() {
+    if [ "${SIGN_ID}" = "-" ]; then
+        codesign --force --sign - "$@"
     else
-        echo ""
-        echo "    Notarization failed. Common fixes:"
-        echo "    1. Store credentials: xcrun notarytool store-credentials 'LidIA-notary'"
-        echo "       (prompts for Apple ID, Team ID, app-specific password)"
-        echo "    2. Create app-specific password at https://appleid.apple.com"
-        echo "    3. Check logs: xcrun notarytool log <submission-id> --keychain-profile 'LidIA-notary'"
+        codesign --force --sign "${SIGN_ID}" --options runtime --timestamp "$@"
     fi
-else
-    echo "==> Step 6/7: Skipping notarization (ad-hoc build)"
+}
+SPARKLE_V="${FRAMEWORKS}/Sparkle.framework/Versions/B"
+sign "${SPARKLE_V}/XPCServices/Installer.xpc"
+sign --preserve-metadata=entitlements "${SPARKLE_V}/XPCServices/Downloader.xpc"
+sign "${SPARKLE_V}/Autoupdate"
+sign "${SPARKLE_V}/Updater.app"
+sign "${FRAMEWORKS}/Sparkle.framework"
+sign "${MACOS}/LidiaMCP"
+APP_ENTITLEMENTS="${ENTITLEMENTS}"
+if [ "${ICLOUD}" = 1 ]; then
+    # shellcheck source=lib/icloud-entitlements.sh
+    source "${ROOT_DIR}/scripts/lib/icloud-entitlements.sh"
+    cp "${ICLOUD_PROFILE}" "${CONTENTS}/embedded.provisionprofile"
+    APP_ENTITLEMENTS="${DIST_DIR}/LidIA-release.entitlements"
+    # Developer ID apps must use CloudKit's Production environment.
+    compose_icloud_entitlements "${ENTITLEMENTS}" "${ICLOUD_PROFILE}" Production "${APP_ENTITLEMENTS}"
+fi
+sign --entitlements "${APP_ENTITLEMENTS}" "${RELEASE_APP}"
+
+codesign --verify --deep --strict --verbose=2 "${RELEASE_APP}"
+if [ "${MODE}" = "sign" ]; then
+    codesign -d --verbose=2 "${RELEASE_APP}" 2>&1 | grep -E "^(Authority|TeamIdentifier|Runtime)" | head -4
+fi
+if [ "${ICLOUD}" = 1 ]; then
+    SIGNED_ENTITLEMENTS="$(codesign -d --entitlements :- "${RELEASE_APP}" 2>/dev/null)"
+    echo "${SIGNED_ENTITLEMENTS}" | grep -q "iCloud.io.lidia.app" || fail "The signed app is missing the iCloud container entitlement."
+    echo "${SIGNED_ENTITLEMENTS}" | grep -q "<string>Production</string>" || fail "The signed app isn't on CloudKit's Production environment."
+    echo "    iCloud: CloudKit Production, profile embedded"
 fi
 
-# 7. Cleanup
-echo "==> Step 7/7: Cleanup..."
+# ---------------------------------------------------------------- DMG
+step "Creating DMG"
+DMG="${DIST_DIR}/${APP_NAME}-${VERSION}.dmg"
+rm -f "${DMG}"
+DMG_STAGE="$(mktemp -d)"
+cp -R "${RELEASE_APP}" "${DMG_STAGE}/"
+ln -s /Applications "${DMG_STAGE}/Applications"
+hdiutil create -volname "${APP_NAME} ${VERSION}" -srcfolder "${DMG_STAGE}" -ov -format UDZO "${DMG}" -quiet
+rm -rf "${DMG_STAGE}"
+[ "${MODE}" = "sign" ] && sign "${DMG}"
+echo "    ${DMG} ($(du -h "${DMG}" | cut -f1))"
+
+# ---------------------------------------------------------------- notarize
+if [ "${MODE}" = "sign" ]; then
+    step "Notarizing (this takes a few minutes)"
+    SUBMIT_LOG="$(mktemp)"
+    # Capture first, then check: piping into `grep -q` makes the pipeline fail
+    # under pipefail (grep exits early, tee gets SIGPIPE) even when accepted.
+    xcrun notarytool submit "${DMG}" --keychain-profile "${NOTARY_PROFILE}" --wait > "${SUBMIT_LOG}" 2>&1 || true
+    if ! grep -q "status: Accepted" "${SUBMIT_LOG}"; then
+        cat "${SUBMIT_LOG}"
+        SUB_ID="$(grep -m1 "id:" "${SUBMIT_LOG}" | awk '{print $2}')"
+        [ -n "${SUB_ID}" ] && xcrun notarytool log "${SUB_ID}" --keychain-profile "${NOTARY_PROFILE}" || true
+        fail "Notarization was not accepted (log above)."
+    fi
+    xcrun stapler staple "${DMG}"
+    xcrun stapler validate "${DMG}"
+    spctl --assess --type open --context context:primary-signature --verbose=2 "${DMG}"
+fi
+
+# ---------------------------------------------------------------- appcast
+APPCAST="${DIST_DIR}/appcast.xml"
+if [ "${MODE}" = "sign" ]; then
+    step "Writing signed appcast"
+    ED_SIGNATURE="$("${SPARKLE_BIN}/sign_update" -p "${DMG}")"
+    cat > "${APPCAST}" <<EOF
+<?xml version="1.0" encoding="utf-8"?>
+<rss version="2.0" xmlns:sparkle="http://www.andymatuschak.org/xml-namespaces/sparkle">
+  <channel>
+    <title>LidIA</title>
+    <link>https://github.com/${RELEASE_REPO}/releases</link>
+    <language>en</language>
+    <item>
+      <title>LidIA ${VERSION}</title>
+      <pubDate>$(LC_ALL=C date -R)</pubDate>
+      <link>https://github.com/${RELEASE_REPO}/releases/tag/v${VERSION}</link>
+      <sparkle:version>${BUILD_NUMBER}</sparkle:version>
+      <sparkle:shortVersionString>${VERSION}</sparkle:shortVersionString>
+      <sparkle:minimumSystemVersion>26.0</sparkle:minimumSystemVersion>
+      <enclosure
+        url="https://github.com/${RELEASE_REPO}/releases/download/v${VERSION}/${APP_NAME}-${VERSION}.dmg"
+        length="$(stat -f%z "${DMG}")"
+        type="application/octet-stream"
+        sparkle:edSignature="${ED_SIGNATURE}"
+      />
+    </item>
+  </channel>
+</rss>
+EOF
+    # SURequireSignedFeed: the feed is signed too. Don't edit it afterwards.
+    "${SPARKLE_BIN}/sign_update" "${APPCAST}"
+    echo "    ${APPCAST}"
+fi
+
 rm -rf "${RELEASE_APP}"
 
-cd "${ROOT_DIR}"
-echo ""
-echo "==> Release artifacts ready in dist/:"
-ls -lh "dist/${ZIP_NAME}" "dist/${DMG_NAME}"
-echo ""
+# ---------------------------------------------------------------- publish
+if [ "${PUBLISH}" = 1 ]; then
+    step "Publishing v${VERSION} to ${RELEASE_REPO}"
+    gh release create "v${VERSION}" "${DMG}" "${APPCAST}" \
+        --repo "${RELEASE_REPO}" \
+        --title "LidIA ${VERSION}" \
+        --notes "Download ${APP_NAME}-${VERSION}.dmg, open it and drag LidIA to Applications. Installed copies update themselves."
+    echo "    https://github.com/${RELEASE_REPO}/releases/tag/v${VERSION}"
+fi
 
-if [ "${SIGN_MODE}" = "sign" ]; then
-    echo "Next steps:"
-    echo "  1. Test: open dist/${DMG_NAME}"
-    echo "  2. Tag:  git tag v${VERSION} && git push --tags"
-    echo "  3. Release: gh release create v${VERSION} dist/${ZIP_NAME} dist/${DMG_NAME} --title 'LidIA ${VERSION}'"
-    echo "  4. Appcast: ./scripts/generate-appcast.sh ${VERSION}"
-else
-    echo "Next steps (unsigned build — for local testing only):"
-    echo "  1. Test: open dist/${DMG_NAME}"
-    echo "  2. For distribution, re-run with: $0 ${VERSION} sign"
+step "Done"
+ls -lh "${DMG}"
+if [ "${MODE}" = "sign" ] && [ "${PUBLISH}" = 0 ]; then
+    echo "Publish with: $0 ${VERSION} --publish   (or upload dist/ files to a GitHub release yourself)"
 fi

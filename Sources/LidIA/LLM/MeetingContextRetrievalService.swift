@@ -50,9 +50,14 @@ struct MeetingContextRetrievalService {
             return Array(meetings.sorted { $0.date > $1.date }.prefix(limit))
         }
 
+        // Compare email addresses parsed out of "Name <email>" and joined lists,
+        // so "Ana <ana@x.com>" matches "ana@x.com"; fall back to the raw strings.
+        let emails = MeetingHistoryMatcher.identities(from: attendees).emails
         let scored = meetings.compactMap { meeting -> (Meeting, Int)? in
-            let meetingAttendees = Set((meeting.calendarAttendees ?? []).map { $0.lowercased() })
-            let overlap = normalized.intersection(meetingAttendees).count
+            let raw = meeting.calendarAttendees ?? []
+            let meetingAttendees = Set(raw.map { $0.lowercased() })
+            let meetingEmails = MeetingHistoryMatcher.identities(from: raw).emails
+            let overlap = max(normalized.intersection(meetingAttendees).count, emails.intersection(meetingEmails).count)
             guard overlap > 0 else { return nil }
             let score = overlap * 10 + recencyScore(for: meeting.date)
             return (meeting, score)

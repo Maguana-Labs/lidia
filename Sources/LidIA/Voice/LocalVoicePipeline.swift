@@ -3,42 +3,36 @@ import SwiftData
 import Synchronization
 import os
 
-/// Local voice pipeline: Parakeet STT → LLM → TTS.
-/// Tool execution, context enrichment, and TTS fallback included.
-/// @unchecked Sendable is safe: all `let` properties are Sendable protocols,
-/// and `currentTask` is protected by a Mutex.
+/// Local voice pipeline: STT → agent (LidIA's tools, any model) → TTS.
+/// The agent fetches meeting data through tools; changes wait for a spoken yes.
+/// @unchecked Sendable is safe: all `let` properties are Sendable, and
+/// `currentTask` is protected by a Mutex.
 final class LocalVoicePipeline: VoicePipeline, @unchecked Sendable {
     private static let logger = Logger(subsystem: "io.lidia.app", category: "LocalVoicePipeline")
 
     private let sttEngine: any STTEngine
-    private let llmClient: any LLMClient
-    private let llmModel: String
+    private let agent: VoiceAgent
     private let ttsEngine: any TTSEngine
     private let fallbackTTS: any TTSEngine
-    private let toolExecutor: VoiceToolExecutor.Configuration
     private let currentTaskMutex = Mutex<Task<Void, Never>?>(nil)
 
     init(
         stt: any STTEngine,
-        llm: any LLMClient,
-        model: String,
+        agent: VoiceAgent,
         tts: any TTSEngine,
-        fallbackTTS: any TTSEngine,
-        toolConfig: VoiceToolExecutor.Configuration
+        fallbackTTS: any TTSEngine
     ) {
         self.sttEngine = stt
-        self.llmClient = llm
-        self.llmModel = model
+        self.agent = agent
         self.ttsEngine = tts
         self.fallbackTTS = fallbackTTS
-        self.toolExecutor = toolConfig
     }
 
     func process(turn: VoiceTurnInput) -> AsyncStream<VoicePipelineEvent> {
         AsyncStream { continuation in
-            let task = Task { [sttEngine, llmClient, llmModel, ttsEngine, fallbackTTS, toolExecutor] in
+            let task = Task { [sttEngine, agent, ttsEngine, fallbackTTS] in
                 do {
-                    // 1. Resample audio 48kHz → 16kHz
+                    // 1. Resample audio to 16 kHz
                     let samples16k = AudioResampler.resample(turn.audioSamples, from: turn.sampleRate, to: 16000)
                     guard !samples16k.isEmpty else {
                         continuation.yield(.finished)
@@ -48,13 +42,8 @@ final class LocalVoicePipeline: VoicePipeline, @unchecked Sendable {
 
                     try Task.checkCancellation()
 
-                    // 2. Transcribe with STT engine, speculatively pre-fetching context
-                    let (transcript, speculativeContext) = await Self.transcribeWithPrefetch(
-                        samples: samples16k,
-                        engine: sttEngine,
-                        contextProvider: turn.contextProvider,
-                        continuation: continuation
-                    )
+                    // 2. Transcribe
+                    let transcript = await Self.transcribe(samples: samples16k, engine: sttEngine, continuation: continuation)
                     guard !transcript.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
                         continuation.yield(.finished)
                         continuation.finish()
@@ -64,106 +53,49 @@ final class LocalVoicePipeline: VoicePipeline, @unchecked Sendable {
 
                     try Task.checkCancellation()
 
-                    // 3. Use speculative context if available, else fetch fresh
-                    let enrichedPrompt: String
-                    if let speculative = speculativeContext {
-                        // Check if speculative result is still valid for the full transcript
-                        enrichedPrompt = speculative
-                        Self.logger.debug("Using speculative context from partial transcript")
-                    } else {
-                        enrichedPrompt = await turn.contextProvider(transcript)
-                    }
-                    let systemPrompt = enrichedPrompt.isEmpty ? turn.baseSystemPrompt : enrichedPrompt
-
-                    // 4. Build messages
-                    var messages = turn.conversationHistory
-                    if !messages.isEmpty, messages[0].role == "system" {
-                        messages[0] = LLMChatMessage(role: "system", content: systemPrompt)
-                    }
-                    messages.append(LLMChatMessage(role: "user", content: transcript))
-
-                    try Task.checkCancellation()
-
-                    // 5. Stream LLM response with sentence-level TTS
-                    var fullResponse = ""
+                    // 3. The agent answers (tools as needed), streamed sentence by sentence to TTS.
+                    let history = turn.conversationHistory.filter { $0.role != "system" }
+                    var spoken = ""
                     var sentenceBuffer = ""
-                    let stream = await llmClient.chatStream(messages: messages, model: llmModel)
+                    var finalAnswer = ""
+                    var note: String?
 
-                    do {
-                        for try await chunk in stream {
-                            try Task.checkCancellation()
-                            fullResponse += chunk
+                    for await event in agent.respond(to: transcript, history: history) {
+                        try Task.checkCancellation()
+                        switch event {
+                        case .text(let chunk):
+                            spoken += chunk
                             sentenceBuffer += chunk
                             continuation.yield(.responseChunk(chunk))
-
-                            // Check for sentence boundaries and synthesize each sentence
                             while let range = sentenceBuffer.rangeOfSentenceBoundary() {
                                 let sentence = String(sentenceBuffer[sentenceBuffer.startIndex..<range.upperBound])
                                     .trimmingCharacters(in: .whitespacesAndNewlines)
                                 sentenceBuffer = String(sentenceBuffer[range.upperBound...])
-
-                                // Strip tool markers before TTS so <tool>...</tool> blocks aren't spoken
-                                let cleaned = VoiceToolExecutor.stripToolMarkers(sentence)
-                                if !cleaned.isEmpty {
-                                    do {
-                                        let audio = try await ttsEngine.synthesize(cleaned)
-                                        if !audio.isEmpty {
-                                            continuation.yield(.audioReady(audio))
-                                        }
-                                    } catch {
-                                        Self.logger.warning("Primary TTS failed for sentence, trying fallback: \(error)")
-                                        if let audio = try? await fallbackTTS.synthesize(cleaned), !audio.isEmpty {
-                                            continuation.yield(.audioReady(audio))
-                                        }
-                                    }
-                                }
+                                await Self.speak(sentence, tts: ttsEngine, fallback: fallbackTTS, continuation: continuation)
                             }
+                        case .reset:
+                            // Text before a tool call that wasn't spoken yet is dropped.
+                            sentenceBuffer = ""
+                        case .finished(let answer, let toolNote):
+                            finalAnswer = answer
+                            note = toolNote
                         }
-                    } catch is CancellationError {
-                        throw CancellationError()
-                    } catch {
-                        Self.logger.error("LLM stream failed: \(error)")
-                        fullResponse = "Sorry, I had trouble with that."
-                        sentenceBuffer = fullResponse
                     }
 
-                    // Flush remaining text in buffer
+                    // Flush what's left; if nothing streamed (an error or a timeout), speak the answer.
                     let remaining = sentenceBuffer.trimmingCharacters(in: .whitespacesAndNewlines)
                     if !remaining.isEmpty {
-                        let cleaned = VoiceToolExecutor.stripToolMarkers(remaining)
-                        if !cleaned.isEmpty {
-                            do {
-                                let audio = try await ttsEngine.synthesize(cleaned)
-                                if !audio.isEmpty {
-                                    continuation.yield(.audioReady(audio))
-                                }
-                            } catch {
-                                Self.logger.warning("Primary TTS failed for remaining text, trying fallback: \(error)")
-                                if let audio = try? await fallbackTTS.synthesize(cleaned), !audio.isEmpty {
-                                    continuation.yield(.audioReady(audio))
-                                }
-                            }
-                        }
+                        await Self.speak(remaining, tts: ttsEngine, fallback: fallbackTTS, continuation: continuation)
+                    } else if spoken.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty, !finalAnswer.isEmpty {
+                        await Self.speak(finalAnswer, tts: ttsEngine, fallback: fallbackTTS, continuation: continuation)
                     }
 
                     try Task.checkCancellation()
 
-                    // 6. Tool execution (on full response)
-                    let toolResult: VoiceToolExecutor.Result
-                    if let context = toolExecutor.modelContext {
-                        toolResult = await MainActor.run {
-                            VoiceToolExecutor.process(response: fullResponse, modelContext: context)
-                        }
-                    } else {
-                        toolResult = VoiceToolExecutor.Result(spokenResponse: fullResponse, executedActions: [])
-                    }
-
-                    continuation.yield(.responseComplete(toolResult.spokenResponse))
-
-                    if !toolResult.executedActions.isEmpty {
-                        let summary = toolResult.executedActions.joined(separator: ", ")
-                        continuation.yield(.toolResult(summary))
-                        Self.logger.info("Voice tools executed: \(summary)")
+                    continuation.yield(.responseComplete(finalAnswer.isEmpty ? spoken : finalAnswer))
+                    if let note {
+                        continuation.yield(.toolResult(note))
+                        Self.logger.info("Voice agent: \(note)")
                     }
 
                     continuation.yield(.finished)
@@ -212,75 +144,43 @@ final class LocalVoicePipeline: VoicePipeline, @unchecked Sendable {
         Self.logger.info("Voice pipeline models unloaded")
     }
 
-    /// Transcribe audio, starting a speculative context pre-fetch once enough words are recognized.
-    /// Returns (finalTranscript, speculativeContextResult).
-    private static func transcribeWithPrefetch(
+    /// Transcribes one utterance, streaming partial text to the orb.
+    private static func transcribe(
         samples: [Float],
         engine: any STTEngine,
-        contextProvider: @Sendable @escaping (String) async -> String,
         continuation: AsyncStream<VoicePipelineEvent>.Continuation
-    ) async -> (String, String?) {
+    ) async -> String {
         let chunk = AudioChunk(samples: samples, sampleRate: 16000, timestamp: 0)
         let stream = engine.transcribe(audioStream: AsyncStream { c in
             c.yield(chunk)
             c.finish()
         })
-
         var words: [String] = []
-        var lastPartial = ""
-        var prefetchTask: Task<String, Never>?
-        var prefetchPartial = ""
-        let prefetchThreshold = 3 // Start prefetch after N words
-
         for await word in stream {
             words.append(word.word)
-            let partial = words.joined(separator: " ")
-            if partial != lastPartial {
-                continuation.yield(.partialTranscript(partial))
-                lastPartial = partial
-            }
-
-            // Kick off speculative context fetch once we have enough words
-            if words.count == prefetchThreshold && prefetchTask == nil {
-                let partialText = partial
-                prefetchPartial = partialText
-                prefetchTask = Task {
-                    await contextProvider(partialText)
-                }
-            }
+            continuation.yield(.partialTranscript(words.joined(separator: " ")))
         }
-
-        let finalTranscript = words.joined(separator: " ")
-
-        // Determine if speculative result is usable
-        guard let task = prefetchTask else {
-            return (finalTranscript, nil)
-        }
-
-        // If final transcript is very different from what we prefetched with, discard
-        let finalTokens = Set(finalTranscript.lowercased().split { !$0.isLetter && !$0.isNumber }.map(String.init).filter { $0.count > 2 })
-        let prefetchTokens = Set(prefetchPartial.lowercased().split { !$0.isLetter && !$0.isNumber }.map(String.init).filter { $0.count > 2 })
-
-        // If partial tokens are a subset of (or mostly overlap with) final tokens, the prefetch is valid
-        let overlap = prefetchTokens.intersection(finalTokens).count
-        let isValid = !prefetchTokens.isEmpty && overlap >= prefetchTokens.count / 2
-
-        if isValid {
-            let result = await task.value
-            return (finalTranscript, result.isEmpty ? nil : result)
-        } else {
-            task.cancel()
-            logger.debug("Speculative context discarded — transcript diverged from partial")
-            return (finalTranscript, nil)
-        }
+        return words.joined(separator: " ")
     }
-}
 
-// MARK: - VoiceToolExecutor Configuration
-
-extension VoiceToolExecutor {
-    struct Configuration: @unchecked Sendable {
-        let modelContext: ModelContext?
+    /// Synthesises one sentence, falling back to the system voice.
+    private static func speak(
+        _ sentence: String,
+        tts: any TTSEngine,
+        fallback: any TTSEngine,
+        continuation: AsyncStream<VoicePipelineEvent>.Continuation
+    ) async {
+        let cleaned = sentence.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !cleaned.isEmpty else { return }
+        do {
+            let audio = try await tts.synthesize(cleaned)
+            if !audio.isEmpty { continuation.yield(.audioReady(audio)) }
+        } catch {
+            logger.warning("Primary TTS failed, trying fallback: \(error)")
+            if let audio = try? await fallback.synthesize(cleaned), !audio.isEmpty {
+                continuation.yield(.audioReady(audio))
+            }
+        }
     }
 }
 

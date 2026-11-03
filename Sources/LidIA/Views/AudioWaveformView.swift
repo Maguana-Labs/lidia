@@ -6,7 +6,7 @@ struct AudioWaveformView: View {
     var isActive: Bool
     var isPaused: Bool = false
     var barCount: Int = 5
-    var color: Color = .red
+    var color: Color = Brand.red
     var style: WaveformStyle = .standard
 
     enum WaveformStyle {
@@ -92,7 +92,7 @@ extension AudioWaveformView {
             isActive: isActive,
             isPaused: isPaused,
             barCount: 4,
-            color: .red,
+            color: Brand.red,
             style: .standard
         )
         .frame(width: 18, height: 14)

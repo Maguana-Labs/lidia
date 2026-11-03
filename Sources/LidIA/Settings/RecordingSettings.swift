@@ -27,6 +27,10 @@ final class RecordingSettings {
     var useSpeechEnhancement: Bool = false {
         didSet { saveDefault(useSpeechEnhancement, forKey: "useSpeechEnhancement") }
     }
+    /// Whether New Note starts transcribing.
+    var noteTranscription: NoteTranscriptionMode = .duringMeetings {
+        didSet { saveDefault(noteTranscription.rawValue, forKey: "noteTranscription") }
+    }
 
     // MARK: - Init
 
@@ -53,6 +57,7 @@ final class RecordingSettings {
         if defaults.object(forKey: "useSpeechEnhancement") != nil {
             useSpeechEnhancement = defaults.bool(forKey: "useSpeechEnhancement")
         }
+        noteTranscription = NoteTranscriptionMode(rawValue: defaults.string(forKey: "noteTranscription") ?? "") ?? .duringMeetings
     }
 
     // MARK: - Persistence Helpers

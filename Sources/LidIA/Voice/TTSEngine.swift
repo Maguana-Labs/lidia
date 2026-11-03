@@ -77,19 +77,11 @@ final class SystemTTSEngine: NSObject, TTSEngine, @unchecked Sendable {
         let guard_ = ResumeOnce()
 
         await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
-            synthesizer.write(utterance) { buffer in
-                if let pcm = buffer as? AVAudioPCMBuffer, pcm.frameLength > 0 {
-                    let frameCount = Int(pcm.frameLength)
-                    let channelCount = Int(pcm.format.channelCount)
-                    // Copy samples from channel 0 immediately
-                    if channelCount > 0, let channelData = pcm.floatChannelData {
-                        let samples = Array(UnsafeBufferPointer(start: channelData[0], count: frameCount))
-                        collector.append(samples: samples, sampleRate: pcm.format.sampleRate, channelCount: channelCount)
-                    }
-                } else if guard_.tryResume() {
-                    cont.resume()
-                }
-            }
+            synthesizer.write(utterance, toBufferCallback: Self.makeBufferCallback(
+                collector: collector,
+                resumeOnce: guard_,
+                continuation: cont
+            ))
         }
 
         let result = collector.finalize()
@@ -97,6 +89,29 @@ final class SystemTTSEngine: NSObject, TTSEngine, @unchecked Sendable {
 
         // Build WAV in memory
         return buildWAV(samples: result.samples, sampleRate: Int(result.sampleRate), channelCount: 1)
+    }
+
+    /// Built outside the main actor on purpose. A closure written inside `synthesize`
+    /// would be main-actor isolated, and AVSpeechSynthesizer calls it on its own queue,
+    /// which traps in Swift 6 (the same reason the mic taps are built this way).
+    private nonisolated static func makeBufferCallback(
+        collector: AudioSampleCollector,
+        resumeOnce: ResumeOnce,
+        continuation: CheckedContinuation<Void, Never>
+    ) -> AVSpeechSynthesizer.BufferCallback {
+        { buffer in
+            if let pcm = buffer as? AVAudioPCMBuffer, pcm.frameLength > 0 {
+                let frameCount = Int(pcm.frameLength)
+                let channelCount = Int(pcm.format.channelCount)
+                // Copy samples from channel 0 immediately
+                if channelCount > 0, let channelData = pcm.floatChannelData {
+                    let samples = Array(UnsafeBufferPointer(start: channelData[0], count: frameCount))
+                    collector.append(samples: samples, sampleRate: pcm.format.sampleRate, channelCount: channelCount)
+                }
+            } else if resumeOnce.tryResume() {
+                continuation.resume()
+            }
+        }
     }
 
     private func buildWAV(samples: [Float], sampleRate: Int, channelCount: Int) -> Data {

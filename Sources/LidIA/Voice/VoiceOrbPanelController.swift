@@ -21,7 +21,7 @@ final class VoiceOrbPanelController {
         let orbView = VoiceOrbContainerView(service: service)
 
         let panel = NSPanel(
-            contentRect: NSRect(x: 0, y: 0, width: 240, height: 300),
+            contentRect: NSRect(x: 0, y: 0, width: 240, height: 380),
             styleMask: [.nonactivatingPanel, .borderless],
             backing: .buffered,
             defer: false
@@ -41,7 +41,7 @@ final class VoiceOrbPanelController {
             panel.setFrameOrigin(NSPoint(x: x, y: y))
         } else if let screen = NSScreen.main {
             let x = (screen.visibleFrame.width - 240) / 2 + screen.visibleFrame.origin.x
-            let y = (screen.visibleFrame.height - 300) / 2 + screen.visibleFrame.origin.y
+            let y = (screen.visibleFrame.height - 380) / 2 + screen.visibleFrame.origin.y
             panel.setFrameOrigin(NSPoint(x: x, y: y))
         }
 
@@ -193,6 +193,27 @@ private struct VoiceOrbContainerView: View {
                     .padding(.bottom, 8)
                     .transition(.opacity)
                     .animation(.easeInOut(duration: 0.2), value: service.partialText)
+            } else if let error = service.lastError {
+                Text(error)
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+                    .lineLimit(3)
+                    .multilineTextAlignment(.center)
+                    .padding(.horizontal, 16)
+                    .padding(.bottom, 8)
+            } else if !service.lastAnswer.isEmpty {
+                // Always visible, so "Read answers aloud" off still shows the answer.
+                ScrollView {
+                    Text(service.lastAnswer)
+                        .font(.caption)
+                        .foregroundStyle(.white.opacity(0.85))
+                        .multilineTextAlignment(.center)
+                        .textSelection(.enabled)
+                        .frame(maxWidth: .infinity)
+                }
+                .frame(maxHeight: 90)
+                .padding(.horizontal, 14)
+                .padding(.bottom, 8)
             }
         }
     }

@@ -34,7 +34,7 @@ struct FloatingTranscriptView: View {
 
                 Image(systemName: "waveform")
                     .symbolEffect(.variableColor.iterative, isActive: true)
-                    .foregroundStyle(.red)
+                    .foregroundStyle(Brand.red)
                     .font(.caption)
 
                 Spacer()
@@ -48,6 +48,7 @@ struct FloatingTranscriptView: View {
                 }
                 .buttonStyle(.plain)
                 .help("Hide panel (recording continues)")
+                .accessibilityLabel("Hide transcript panel")
             }
             .padding(.horizontal, 12)
             .padding(.top, 10)

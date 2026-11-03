@@ -3,6 +3,12 @@ import SwiftData
 
 struct PersonDetailView: View {
     let profile: RelationshipStore.PersonProfile
+
+    // The profile is a snapshot; items in it can be deleted later (sync, MCP,
+    // voice, another window). Reading a deleted model traps, so skip those.
+    private var liveOpenItems: [ActionItem] { profile.openActionItems.filter { !$0.isDeleted && $0.modelContext != nil } }
+    private var liveMeetings: [Meeting] { profile.recentMeetings.filter { !$0.isDeleted && $0.modelContext != nil } }
+    private var liveTalkingPoints: [TalkingPoint] { profile.talkingPoints.filter { !$0.isDeleted && $0.modelContext != nil } }
     @Binding var selectedMeeting: Meeting?
     @Environment(\.modelContext) private var modelContext
     @Environment(AppSettings.self) private var settings
@@ -13,7 +19,7 @@ struct PersonDetailView: View {
     }
 
     private var overdueItems: [ActionItem] {
-        profile.openActionItems.filter { item in
+        liveOpenItems.filter { item in
             guard let meeting = item.meeting else { return false }
             return (Calendar.current.dateComponents([.day], from: meeting.date, to: .now).day ?? 0) > 7
         }
@@ -52,7 +58,7 @@ struct PersonDetailView: View {
                         Text(relationshipStatusLine(
                             daysSinceLastMet: Calendar.current.dateComponents([.day], from: profile.lastMet, to: .now).day ?? 0,
                             overdueCount: overdueItems.count,
-                            totalOpen: profile.openActionItems.count
+                            totalOpen: liveOpenItems.count
                         ))
                             .font(.caption)
                             .foregroundStyle(.secondary)
@@ -82,7 +88,7 @@ struct PersonDetailView: View {
                 }
 
                 // Open action items (excluding those already shown as overdue)
-                let nonOverdueItems = profile.openActionItems.filter { item in
+                let nonOverdueItems = liveOpenItems.filter { item in
                     !overdueItems.contains(where: { $0.id == item.id })
                 }
                 if !nonOverdueItems.isEmpty {
@@ -106,7 +112,7 @@ struct PersonDetailView: View {
 
                 // Talking points
                 Section("Talking Points for Next Meeting") {
-                    ForEach(profile.talkingPoints, id: \.id) { tp in
+                    ForEach(liveTalkingPoints, id: \.id) { tp in
                         HStack {
                             Text("• \(tp.content)")
                                 .font(.subheadline)
@@ -118,6 +124,8 @@ struct PersonDetailView: View {
                                 Image(systemName: "checkmark")
                             }
                             .buttonStyle(.borderless)
+                            .accessibilityLabel("Mark talking point as covered")
+                            .help("Mark as covered")
                         }
                     }
 
@@ -132,7 +140,7 @@ struct PersonDetailView: View {
 
                 // Meeting history
                 Section("Meeting History") {
-                    ForEach(profile.recentMeetings, id: \.id) { meeting in
+                    ForEach(liveMeetings, id: \.id) { meeting in
                         Button {
                             selectedMeeting = meeting
                         } label: {

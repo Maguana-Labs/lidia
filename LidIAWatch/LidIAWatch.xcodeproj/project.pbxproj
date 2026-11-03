@@ -25,6 +25,7 @@
 		ED1420C9EDB4EDE98C486262 /* QuickCaptureView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = QuickCaptureView.swift; sourceTree = "<group>"; };
 		F27174439B0F4EE269FB742C /* ActionItemsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ActionItemsView.swift; sourceTree = "<group>"; };
 		F81F1997C86BD38B28AE7663 /* NextMeetingView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NextMeetingView.swift; sourceTree = "<group>"; };
+		5161A0000000000000000002 /* Signing.xcconfig */ = {isa = PBXFileReference; lastKnownFileType = text.xcconfig; name = Signing.xcconfig; path = ../Config/Signing.xcconfig; sourceTree = SOURCE_ROOT; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -78,6 +79,7 @@
 		EA2CC3D5269B0CD537E88E89 = {
 			isa = PBXGroup;
 			children = (
+				5161A0000000000000000002 /* Signing.xcconfig */,
 				D31D2C24AEAE997B1CDA417B /* Packages */,
 				8D1411DD945C43BEC14EB5E1 /* Resources */,
 				2C4CE10550FD1716D70F39FA /* Sources */,
@@ -118,7 +120,6 @@
 				LastUpgradeCheck = 2600;
 				TargetAttributes = {
 					AA67FF6AFA5168F3C9C2E33A = {
-						DevelopmentTeam = "";
 						ProvisioningStyle = Automatic;
 					};
 				};
@@ -178,7 +179,6 @@
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
-				DEVELOPMENT_TEAM = "";
 				INFOPLIST_FILE = Resources/Info.plist;
 				MARKETING_VERSION = 0.1.0;
 				PRODUCT_BUNDLE_IDENTIFIER = io.lidia.watch;
@@ -191,6 +191,7 @@
 		};
 		741CF59B6EA8B799E3812153 /* Debug */ = {
 			isa = XCBuildConfiguration;
+			baseConfigurationReference = 5161A0000000000000000002 /* Signing.xcconfig */;
 			buildSettings = {
 				ALWAYS_SEARCH_USER_PATHS = NO;
 				CLANG_ANALYZER_NONNULL = YES;
@@ -258,7 +259,6 @@
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
-				DEVELOPMENT_TEAM = "";
 				INFOPLIST_FILE = Resources/Info.plist;
 				MARKETING_VERSION = 0.1.0;
 				PRODUCT_BUNDLE_IDENTIFIER = io.lidia.watch;
@@ -271,6 +271,7 @@
 		};
 		CDE2329C0544044088617108 /* Release */ = {
 			isa = XCBuildConfiguration;
+			baseConfigurationReference = 5161A0000000000000000002 /* Signing.xcconfig */;
 			buildSettings = {
 				ALWAYS_SEARCH_USER_PATHS = NO;
 				CLANG_ANALYZER_NONNULL = YES;

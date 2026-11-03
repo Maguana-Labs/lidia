@@ -30,7 +30,9 @@ Examples of unacceptable behavior:
 ## Enforcement
 
 Instances of abusive, harassing, or otherwise unacceptable behavior may be
-reported to the project maintainers at **julio@juliops.eu**.
+reported to the project maintainers privately through
+[GitHub's private reporting](https://github.com/Maguana-Labs/lidia/security/advisories/new)
+(choose "Code of Conduct" in the title), or by opening an issue that asks a maintainer to contact you.
 
 All complaints will be reviewed and investigated promptly and fairly. The project
 team is obligated to maintain confidentiality with regard to the reporter.

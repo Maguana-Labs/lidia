@@ -127,6 +127,28 @@ struct MeetingContextBuilderTests {
         }
     }
 
+    @MainActor
+    @Test("No confidence badge for answers that used no meetings")
+    func displayedConfidenceHiddenForGeneralAnswers() {
+        let builder = MeetingContextBuilder()
+        #expect(builder.displayedConfidence(answer: "Hi! How can I help?", sourceCount: 0) == nil)
+        #expect(builder.displayedConfidence(answer: "[Error: offline]", sourceCount: 0) == .low)
+        #expect(builder.displayedConfidence(answer: "I don't have enough information.", sourceCount: 0) == .low)
+        #expect(builder.displayedConfidence(answer: "They agreed.", sourceCount: 2) == .high)
+    }
+
+    @Test("Chat prompt lets the model chat and still grounds meeting answers")
+    func chatPromptAllowsGeneralConversation() {
+        let empty = LidIAChatPrompt.system(context: "")
+        #expect(empty.contains("No meeting context matched"))
+        #expect(empty.contains("You can talk about anything"))
+        #expect(!empty.contains("Insufficient evidence"))
+
+        let grounded = LidIAChatPrompt.system(context: "Meeting: Q4 planning")
+        #expect(grounded.contains("Meeting: Q4 planning"))
+        #expect(grounded.contains("never invent meeting details"))
+    }
+
     // MARK: - buildContextBundle edge cases (no modelContext configured)
 
     @MainActor

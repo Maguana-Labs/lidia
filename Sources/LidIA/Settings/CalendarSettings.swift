@@ -40,8 +40,16 @@ final class CalendarSettings {
         didSet { saveDefault(meetingNotificationMinutes, forKey: "meetingNotificationMinutes") }
     }
 
+    /// Calendars the user switched off in Settings › Calendars. Apple
+    /// calendars use their EventKit `calendarIdentifier`; the Google account's
+    /// primary calendar uses `CalendarVisibility.googlePrimaryID`. Their events
+    /// are left out of the agenda, meeting prompts and the menu bar.
+    var hiddenCalendarIDs: [String] = [] {
+        didSet { saveDefault(hiddenCalendarIDs, forKey: "hiddenCalendarIDs") }
+    }
+
     // Proactive Assistant
-    var proactiveMorningDigest: Bool = false {
+    var proactiveMorningDigest: Bool = true {
         didSet { saveDefault(proactiveMorningDigest, forKey: "proactiveMorningDigest") }
     }
     var proactiveMorningDigestTime: Date = CalendarSettings.defaultTime(hour: 8, minute: 30) {
@@ -50,19 +58,19 @@ final class CalendarSettings {
     var proactiveMorningDigestFrequency: String = "daily" {
         didSet { saveDefault(proactiveMorningDigestFrequency, forKey: "proactiveMorningDigestFrequency") }
     }
-    var proactivePreMeetingPrep: Bool = false {
+    var proactivePreMeetingPrep: Bool = true {
         didSet { saveDefault(proactivePreMeetingPrep, forKey: "proactivePreMeetingPrep") }
     }
     var proactivePreMeetingMinutes: Int = 10 {
         didSet { saveDefault(proactivePreMeetingMinutes, forKey: "proactivePreMeetingMinutes") }
     }
-    var proactivePostMeetingNudge: Bool = false {
+    var proactivePostMeetingNudge: Bool = true {
         didSet { saveDefault(proactivePostMeetingNudge, forKey: "proactivePostMeetingNudge") }
     }
     var proactivePostMeetingMinutes: Int = 15 {
         didSet { saveDefault(proactivePostMeetingMinutes, forKey: "proactivePostMeetingMinutes") }
     }
-    var proactiveActionItemReminders: Bool = false {
+    var proactiveActionItemReminders: Bool = true {
         didSet { saveDefault(proactiveActionItemReminders, forKey: "proactiveActionItemReminders") }
     }
     var proactiveQuietStart: Date = CalendarSettings.defaultTime(hour: 22, minute: 0) {
@@ -102,6 +110,7 @@ final class CalendarSettings {
         if let prepEnabled = defaults.object(forKey: "prepNotificationsEnabled") as? Bool {
             prepNotificationsEnabled = prepEnabled
         }
+        hiddenCalendarIDs = defaults.stringArray(forKey: "hiddenCalendarIDs") ?? []
         if let minutes = defaults.object(forKey: "meetingNotificationMinutes") as? Int {
             meetingNotificationMinutes = minutes
         }

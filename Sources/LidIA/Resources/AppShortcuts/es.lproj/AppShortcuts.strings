@@ -1,0 +1,23 @@
+/* Frases de App Shortcuts en español (Siri, Spotlight, Atajos). Las claves
+   son las frases en inglés de Sources/LidIA/Siri/MacIntents.swift. */
+
+"Record a meeting with ${applicationName}" = "Graba una reunión con ${applicationName}";
+"Start recording in ${applicationName}" = "Empieza a grabar en ${applicationName}";
+"Stop recording in ${applicationName}" = "Deja de grabar en ${applicationName}";
+"Stop the ${applicationName} recording" = "Para la grabación de ${applicationName}";
+"Add a note in ${applicationName}" = "Añade una nota en ${applicationName}";
+"Take a note in ${applicationName}" = "Toma una nota en ${applicationName}";
+"Bookmark this moment in ${applicationName}" = "Marca este momento en ${applicationName}";
+"Mark this moment in ${applicationName}" = "Guarda este momento en ${applicationName}";
+"New note in ${applicationName}" = "Nueva nota en ${applicationName}";
+"Write a note in ${applicationName}" = "Escribe una nota en ${applicationName}";
+"Find meetings in ${applicationName}" = "Busca reuniones en ${applicationName}";
+"Search my ${applicationName} meetings" = "Busca en mis reuniones de ${applicationName}";
+"Show my action items in ${applicationName}" = "Muestra mis tareas en ${applicationName}";
+"What's on my plate in ${applicationName}" = "Qué tengo pendiente en ${applicationName}";
+"Summarize a meeting in ${applicationName}" = "Resume una reunión en ${applicationName}";
+"Get meeting notes from ${applicationName}" = "Dame las notas de la reunión de ${applicationName}";
+"Ask ${applicationName}" = "Pregunta a ${applicationName}";
+"Ask ${applicationName} about my meetings" = "Pregunta a ${applicationName} sobre mis reuniones";
+"Draft a follow-up in ${applicationName}" = "Redacta un seguimiento en ${applicationName}";
+"Write a meeting follow-up with ${applicationName}" = "Escribe el seguimiento de una reunión con ${applicationName}";

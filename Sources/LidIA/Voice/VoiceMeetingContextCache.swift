@@ -8,8 +8,7 @@ import os
 final class VoiceMeetingContextCache {
     private static let logger = Logger(subsystem: "io.lidia.app", category: "VoiceContextCache")
 
-    /// Cached list of completed meetings, refreshed when count changes.
-    private var cachedMeetings: [Meeting] = []
+    /// Completed-meeting count at the last fetch; a change clears the context cache.
     private var cachedMeetingCount: Int = 0
     private var meetingsLastFetched: Date = .distantPast
 
@@ -18,9 +17,6 @@ final class VoiceMeetingContextCache {
 
     /// How long cached context remains valid.
     private let contextTTL: TimeInterval = 30
-
-    /// How long the meetings list remains valid before re-checking count.
-    private let meetingsCheckInterval: TimeInterval = 10
 
     private let modelContext: ModelContext
 
@@ -86,7 +82,6 @@ final class VoiceMeetingContextCache {
 
     /// Invalidate all cached context (call on session end, meeting change, etc).
     func invalidate() {
-        cachedMeetings = []
         cachedMeetingCount = 0
         meetingsLastFetched = .distantPast
         contextCache = [:]
@@ -99,12 +94,10 @@ final class VoiceMeetingContextCache {
 
     // MARK: - Private
 
+    /// Fetches on every turn. Meetings are never reused from an earlier fetch: one
+    /// deleted since (by the user, sync or the MCP inbox) traps when it is read.
     private func refreshMeetingsIfNeeded() -> [Meeting] {
         let now = Date.now
-        guard now.timeIntervalSince(meetingsLastFetched) >= meetingsCheckInterval else {
-            return cachedMeetings
-        }
-
         let context = modelContext
         do {
             let descriptor = FetchDescriptor<Meeting>(
@@ -119,13 +112,12 @@ final class VoiceMeetingContextCache {
                 Self.logger.info("Meeting count changed (\(self.cachedMeetingCount) → \(completed.count)), invalidated context cache")
             }
 
-            cachedMeetings = completed
             cachedMeetingCount = completed.count
             meetingsLastFetched = now
             return completed
         } catch {
             Self.logger.error("Failed to fetch meetings: \(error)")
-            return cachedMeetings
+            return []
         }
     }
 

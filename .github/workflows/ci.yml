@@ -8,32 +8,63 @@ on:
 
 jobs:
   build-and-test:
-    # This project requires macOS 26 (Tahoe) + Swift 6.2.
-    # GitHub Actions does not yet offer macOS 26 runners.
-    # CI will be enabled once macOS 26 runners are available.
-    # For now, we run a syntax/lint check only.
-    runs-on: macos-latest
+    # macOS 26 (Tahoe) + Xcode 26 are required: SwiftData macros and the
+    # Liquid Glass APIs are not available in older toolchains.
+    runs-on: macos-26
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Show Swift Version
-        run: swift --version
-
-      - name: Check Swift tools version
+      - name: Show toolchain
         run: |
-          REQUIRED="6.2"
-          INSTALLED=$(swift --version 2>&1 | grep -oE 'Swift version [0-9]+\.[0-9]+' | grep -oE '[0-9]+\.[0-9]+')
-          echo "Required: $REQUIRED, Installed: $INSTALLED"
-          if [ "$(printf '%s\n' "$REQUIRED" "$INSTALLED" | sort -V | head -1)" != "$REQUIRED" ]; then
-            echo "::warning::Swift $REQUIRED required but $INSTALLED installed. Skipping build until macOS 26 runners are available."
-            echo "SKIP_BUILD=true" >> $GITHUB_ENV
-          fi
+          xcodebuild -version
+          swift --version
+
+      - name: Cache SwiftPM
+        uses: actions/cache@v4
+        with:
+          path: .build
+          key: spm-${{ runner.os }}-${{ hashFiles('Package.resolved', 'Packages/LidIAKit/Package.swift') }}
+          restore-keys: spm-${{ runner.os }}-
 
       - name: Build
-        if: env.SKIP_BUILD != 'true'
         run: swift build
 
       - name: Test
-        if: env.SKIP_BUILD != 'true'
         run: swift test
+
+  lidiakit:
+    # The shared package is consumed by the iOS and watchOS apps, which the
+    # SwiftPM build above does not cover.
+    runs-on: macos-26
+    strategy:
+      matrix:
+        destination:
+          - generic/platform=iOS
+          - generic/platform=watchOS
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build LidIAKit
+        working-directory: Packages/LidIAKit
+        run: xcodebuild build -scheme LidIAKit -destination '${{ matrix.destination }}' -skipPackagePluginValidation
+
+  apple-apps:
+    # iOS and watchOS are frozen but must keep compiling.
+    runs-on: macos-26
+    strategy:
+      matrix:
+        include:
+          - project: LidIAiOS/LidIAiOS.xcodeproj
+            scheme: LidIAiOS
+            destination: generic/platform=iOS
+          - project: LidIAWatch/LidIAWatch.xcodeproj
+            scheme: LidIAWatch
+            destination: generic/platform=watchOS
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build ${{ matrix.scheme }}
+        run: xcodebuild build -project '${{ matrix.project }}' -scheme '${{ matrix.scheme }}' -destination '${{ matrix.destination }}' CODE_SIGNING_ALLOWED=NO -skipPackagePluginValidation

@@ -6,6 +6,9 @@ import UserNotifications
 @Observable
 final class GoogleCalendarMonitor {
     private static let logger = Logger(subsystem: "io.lidia.app", category: "GoogleCalendarMonitor")
+    /// Enough for a busy week of daily recurring meetings across calendars
+    /// (Coming up lists every one); 50 cut weeks short.
+    static let weekEventLimit = 250
 
     var upcomingEvents: [GoogleCalendarClient.CalendarEvent] = []
     var weekEvents: [GoogleCalendarClient.CalendarEvent] = []
@@ -16,15 +19,21 @@ final class GoogleCalendarMonitor {
     private var pollTask: Task<Void, Never>?
     private var oauth: GoogleOAuth?
     private var eventColors: [String: String] = [:]
+    /// Read for the calendars switched off in Settings › Calendars.
+    private weak var settings: AppSettings?
 
-    /// Initialize with OAuth credentials. Call once at app startup.
+    private var hiddenCalendarIDs: [String] { settings?.hiddenCalendarIDs ?? [] }
+
+    /// Sets up the OAuth client: the one from Settings → Advanced if the user
+    /// entered one, else the one bundled in Info.plist. Call at app startup and
+    /// before signing in.
     func configure(settings: AppSettings) {
-        guard !settings.googleClientID.isEmpty,
-              !settings.googleClientSecret.isEmpty else { return }
-        let oauth = GoogleOAuth(
-            clientID: settings.googleClientID,
-            clientSecret: settings.googleClientSecret
-        )
+        self.settings = settings
+        guard let credentials = GoogleOAuthCredentials.resolve(settings: settings) else {
+            oauth = nil
+            return
+        }
+        let oauth = GoogleOAuth(credentials: credentials)
         self.oauth = oauth
 
         Task {
@@ -38,7 +47,7 @@ final class GoogleCalendarMonitor {
     /// Sign in via browser OAuth flow
     func signIn(settings: AppSettings) async {
         guard let oauth else {
-            error = "Google Calendar not configured. Add Client ID and Secret in Settings."
+            error = "Google sign-in isn't available in this build."
             return
         }
         do {
@@ -67,6 +76,7 @@ final class GoogleCalendarMonitor {
 
     func startPolling(settings: AppSettings) {
         stopPolling()
+        self.settings = settings
         guard settings.googleCalendarEnabled,
               let oauth,
               isSignedIn else {
@@ -103,7 +113,10 @@ final class GoogleCalendarMonitor {
             if eventColors.isEmpty {
                 eventColors = (try? await client.fetchEventColors()) ?? [:]
             }
-            weekEvents = try await client.listEventsForDateRange(from: monday, to: fridayEnd, maxResults: 50, colorMap: eventColors)
+            weekEvents = CalendarVisibility.visibleGoogleEvents(
+                try await client.listEventsForDateRange(from: monday, to: fridayEnd, maxResults: Self.weekEventLimit, colorMap: eventColors),
+                hidden: hiddenCalendarIDs
+            )
             Self.logger.info("Fetched \(self.weekEvents.count) week events")
         } catch {
             Self.logger.error("Error fetching week: \(error)")
@@ -119,32 +132,26 @@ final class GoogleCalendarMonitor {
             if eventColors.isEmpty {
                 eventColors = (try? await client.fetchEventColors()) ?? [:]
             }
-            upcomingEvents = try await client.listUpcomingEvents(maxResults: 10)
-                .filter { $0.end >= Date() }
+            let hidden = settings.hiddenCalendarIDs
+            upcomingEvents = CalendarVisibility.visibleGoogleEvents(
+                try await client.listUpcomingEvents(maxResults: 10).filter { $0.end >= Date() },
+                hidden: hidden
+            )
             Self.logger.info("Fetched \(self.upcomingEvents.count) events")
 
             // Also refresh week events for the Home "Coming up" view
             let calendar = Calendar.current
             let today = calendar.startOfDay(for: Date())
             if let weekEnd = calendar.date(byAdding: .day, value: 7, to: today) {
-                weekEvents = try await client.listEventsForDateRange(from: Date(), to: weekEnd, maxResults: 50, colorMap: eventColors)
+                weekEvents = CalendarVisibility.visibleGoogleEvents(
+                    try await client.listEventsForDateRange(from: Date(), to: weekEnd, maxResults: Self.weekEventLimit, colorMap: eventColors),
+                    hidden: hidden
+                )
                 Self.logger.info("Refreshed \(self.weekEvents.count) week events")
             }
 
-            // Schedule reminders/prompts for Google Calendar events
-            if settings.notifyUpcomingMeetings || settings.calendarRecordPromptEnabled {
-                for event in upcomingEvents {
-                    EventKitManager.scheduleEventNotifications(
-                        eventID: event.id,
-                        title: event.title,
-                        start: event.start,
-                        meetingLink: event.meetingLink,
-                        minutesBefore: [settings.meetingNotificationMinutes, 1],
-                        includeRecordPrompt: settings.calendarRecordPromptEnabled,
-                        prepSummary: nil
-                    )
-                }
-            }
+            // Pre-meeting prompts are owned by ProactiveScheduler (deduped
+            // against Apple Calendar, one prompt per meeting).
         } catch {
             Self.logger.error("Error fetching events: \(error)")
             self.error = error.localizedDescription

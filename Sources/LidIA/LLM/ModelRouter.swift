@@ -20,33 +20,34 @@ enum ModelRouter {
         }
     }
 
+    /// A reasoning-capable model from the provider's fetched list, when one
+    /// is listed; otherwise the normal model. Nothing is hard-coded, so a
+    /// model the provider no longer offers is never requested.
     private static func thinkingModel(for settings: AppSettings) -> String {
-        switch settings.llmProvider {
-        case .openai:
-            let thinking = settings.availableModels.first(where: {
-                $0.hasPrefix("o3") || $0.hasPrefix("o4") || $0.contains("thinking")
-            })
-            return thinking ?? (settings.openaiModel.isEmpty ? "gpt-4o" : settings.openaiModel)
-        case .ollama:
-            return settings.ollamaModel
-        case .lmStudio:
-            return settings.lmStudioModel
-        case .mlx:
-            return settings.selectedMLXModelID
-        case .anthropic:
-            return settings.anthropicModel
-        case .cerebras:
-            return settings.cerebrasModel
-        case .deepseek:
-            return "deepseek-reasoner"
-        case .nvidiaNIM:
-            return settings.nvidiaModel
-        case .openRouter:
-            return settings.openRouterModel
+        let fallback = defaultModel(for: settings)
+        // The fetched list belongs to the main provider; only use it when
+        // Ask resolves there.
+        let provider = resolvedProvider(settings: settings, taskType: .ask)
+        guard provider == settings.llmProvider, provider.group == .cloud else { return fallback }
+        let markers = reasoningMarkers(for: provider)
+        guard !markers.isEmpty else { return fallback }
+        let match = settings.availableModels.first { id in
+            let lower = id.lowercased()
+            return markers.contains { lower.contains($0) }
+        }
+        return match ?? fallback
+    }
+
+    nonisolated static func reasoningMarkers(for provider: AppSettings.LLMProvider) -> [String] {
+        switch provider {
+        case .openai: return ["o4", "o3", "thinking"]
+        case .deepseek: return ["reasoner"]
+        case .openRouter, .groq, .cerebras, .nvidiaNIM, .gemini, .openAICompatible: return ["thinking", "reasoner", "-r1"]
+        case .anthropic, .automaticLocal, .appleOnDevice, .mlx, .ollama, .lmStudio, .codexCLI, .grokCLI: return []
         }
     }
 
     private static func defaultModel(for settings: AppSettings) -> String {
-        return effectiveModel(for: .query, settings: settings)
+        return effectiveModel(for: .query, settings: settings, taskType: .ask)
     }
 }

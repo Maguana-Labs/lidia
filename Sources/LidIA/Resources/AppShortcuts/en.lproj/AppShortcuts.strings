@@ -1,0 +1,24 @@
+/* App Shortcut phrases (Siri, Spotlight, Shortcuts). Keys are the phrases in
+   Sources/LidIA/Siri/MacIntents.swift (LidIAShortcuts); every phrase must
+   contain ${applicationName}. Copied into LidIA.app by run.sh. */
+
+"Record a meeting with ${applicationName}" = "Record a meeting with ${applicationName}";
+"Start recording in ${applicationName}" = "Start recording in ${applicationName}";
+"Stop recording in ${applicationName}" = "Stop recording in ${applicationName}";
+"Stop the ${applicationName} recording" = "Stop the ${applicationName} recording";
+"Add a note in ${applicationName}" = "Add a note in ${applicationName}";
+"Take a note in ${applicationName}" = "Take a note in ${applicationName}";
+"Bookmark this moment in ${applicationName}" = "Bookmark this moment in ${applicationName}";
+"Mark this moment in ${applicationName}" = "Mark this moment in ${applicationName}";
+"New note in ${applicationName}" = "New note in ${applicationName}";
+"Write a note in ${applicationName}" = "Write a note in ${applicationName}";
+"Find meetings in ${applicationName}" = "Find meetings in ${applicationName}";
+"Search my ${applicationName} meetings" = "Search my ${applicationName} meetings";
+"Show my action items in ${applicationName}" = "Show my action items in ${applicationName}";
+"What's on my plate in ${applicationName}" = "What's on my plate in ${applicationName}";
+"Summarize a meeting in ${applicationName}" = "Summarize a meeting in ${applicationName}";
+"Get meeting notes from ${applicationName}" = "Get meeting notes from ${applicationName}";
+"Ask ${applicationName}" = "Ask ${applicationName}";
+"Ask ${applicationName} about my meetings" = "Ask ${applicationName} about my meetings";
+"Draft a follow-up in ${applicationName}" = "Draft a follow-up in ${applicationName}";
+"Write a meeting follow-up with ${applicationName}" = "Write a meeting follow-up with ${applicationName}";

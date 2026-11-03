@@ -4,25 +4,62 @@ import SwiftUI
 struct ActionItemDashboardView: View {
     @Environment(AppSettings.self) private var settings
     @Environment(EventKitManager.self) private var eventKitManager
+    @Environment(ModelManager.self) private var modelManager
+    @Environment(GoogleCalendarMonitor.self) private var googleCalendarMonitor
     @Environment(\.modelContext) private var modelContext
     @Query(sort: \Meeting.date, order: .reverse) private var meetings: [Meeting]
+    /// Observed directly (not cached): an item deleted elsewhere (MCP inbox, voice
+    /// assistant, sync, Regenerate) leaves this query before any row can read it.
+    @Query private var actionItems: [ActionItem]
     @Binding var selectedMeeting: Meeting?
 
     @AppStorage("actionItems.showCompleted") private var showCompleted = false
     @AppStorage("actionItems.showMyItemsOnly") private var showMyItemsOnly = true
     @AppStorage("actionItems.priorityFilter") private var priorityFilter = "all"
+    @AppStorage("actionItems.layout") private var layout = "board"
+    @AppStorage("actionItems.boardGrouping") private var boardGrouping: ActionItemBoardGrouping = .none
+    @AppStorage("actionItems.showWaiting") private var showWaiting = true
     @State private var filterText = ""
     @State private var isSyncingToNotion = false
     @State private var alertTitle: String = "Action Items"
     @State private var alertMessage: String?
     @State private var hoveredItemID: UUID?
-    @State private var cachedActionItems: [(ActionItem, Meeting)] = []
     @State private var isDispatching = false
     @State private var newActionItemTitle = ""
+    @State private var intentSheet: IntentSheetItem?
 
-    private var filteredItems: [(ActionItem, Meeting)] {
-        cachedActionItems.filter { item, meeting in
-            if !showCompleted && item.isCompleted { return false }
+    /// Intents for the open items of recent meetings (older ones on demand).
+    private func refreshIntents() {
+        let cutoff = Date.now.addingTimeInterval(-45 * 86_400)
+        var ids: [UUID] = []
+        for (item, meeting) in filtered(includeCompleted: false) where !item.isCompleted && meeting.date >= cutoff && !ids.contains(meeting.id) {
+            ids.append(meeting.id)
+        }
+        IntentRuntime.refresh(
+            meetingIDs: ids, settings: settings, modelManager: modelManager,
+            eventKit: eventKitManager, google: googleCalendarMonitor, modelContext: modelContext
+        )
+    }
+
+    /// Action items of complete meetings, newest meeting first.
+    static func rows(from items: [ActionItem]) -> [(ActionItem, Meeting)] {
+        items
+            .compactMap { item in
+                guard let meeting = item.meeting, meeting.status == .complete else { return nil }
+                return (item, meeting)
+            }
+            .sorted { $0.1.date > $1.1.date }
+    }
+
+    private var isBoard: Bool { layout == "board" }
+
+    private var filteredItems: [(ActionItem, Meeting)] { filtered(includeCompleted: showCompleted) }
+
+    /// The board always shows Done; the list hides completed items unless asked.
+    private func filtered(includeCompleted: Bool) -> [(ActionItem, Meeting)] {
+        Self.rows(from: actionItems).filter { item, meeting in
+            if item.isDeleted { return false }
+            if !includeCompleted && item.isCompleted { return false }
             if priorityFilter == "urgent" && !item.isUrgent { return false }
             if priorityFilter != "all" && priorityFilter != "urgent" && item.priority != priorityFilter { return false }
             if showMyItemsOnly {
@@ -51,114 +88,181 @@ struct ActionItemDashboardView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
-            HStack(spacing: 8) {
-                Button {
-                    showMyItemsOnly.toggle()
-                } label: {
-                    HStack(spacing: 4) {
-                        Image(systemName: showMyItemsOnly ? "person.fill" : "person.2")
-                            .font(.caption)
-                        Text(showMyItemsOnly ? "My Items" : "Everyone")
-                            .font(.caption)
-                    }
-                    .padding(.horizontal, 10)
-                    .padding(.vertical, 6)
+            HStack(spacing: 10) {
+                Picker("Layout", selection: $layout) {
+                    Label("Board", systemImage: "square.grid.3x1.below.line.grid.1x2").tag("board")
+                    Label("List", systemImage: "list.bullet").tag("list")
                 }
-                .buttonStyle(.plain)
-                .glassEffect(showMyItemsOnly ? .regular.tint(.accentColor.opacity(0.3)) : .regular, in: .capsule)
+                .pickerStyle(.segmented)
+                .labelStyle(.iconOnly)
+                .labelsHidden()
+                .fixedSize()
+                .help("Show action items as a board or a list")
+
+                Picker("Show", selection: $showMyItemsOnly) {
+                    Text("Mine").tag(true)
+                    Text("Everyone").tag(false)
+                }
+                .pickerStyle(.segmented)
+                .labelsHidden()
+                .fixedSize()
+                .help("Show items assigned to you, or everyone's")
 
                 HStack(spacing: 6) {
                     Image(systemName: "magnifyingglass")
                         .foregroundStyle(.tertiary)
-                        .font(.caption)
-                    TextField("Filter...", text: $filterText)
+                        .accessibilityHidden(true)
+                    TextField("Search action items", text: $filterText)
+                        .accessibilityLabel("Filter action items")
                         .textFieldStyle(.plain)
-                        .font(.subheadline)
                     if !filterText.isEmpty {
                         Button { filterText = "" } label: {
                             Image(systemName: "xmark.circle.fill")
                                 .foregroundStyle(.tertiary)
-                                .font(.caption)
                         }
                         .buttonStyle(.plain)
+                        .accessibilityLabel("Clear filter")
+                        .help("Clear filter")
                     }
                 }
                 .padding(.horizontal, 10)
-                .padding(.vertical, 6)
-                .glassEffect(.regular, in: .capsule)
-                .frame(maxWidth: 200)
-
-                Button {
-                    showCompleted.toggle()
-                } label: {
-                    HStack(spacing: 4) {
-                        Image(systemName: showCompleted ? "eye" : "eye.slash")
-                            .font(.caption)
-                        Text(showCompleted ? "Hiding done" : "Show done")
-                            .font(.caption)
-                    }
-                    .padding(.horizontal, 10)
-                    .padding(.vertical, 6)
-                }
-                .buttonStyle(.plain)
-                .glassEffect(showCompleted ? .regular.tint(.green.opacity(0.3)) : .regular, in: .capsule)
+                .frame(height: 28)
+                .background(Color.primary.opacity(0.05), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+                .overlay(RoundedRectangle(cornerRadius: 8, style: .continuous).strokeBorder(Color(nsColor: .separatorColor).opacity(0.5), lineWidth: 0.5))
+                .frame(maxWidth: 260)
 
                 Menu {
-                    Button("All") { priorityFilter = "all" }
-                    Button("Urgent+") { priorityFilter = "urgent" }
-                    Divider()
-                    Button("Critical") { priorityFilter = "critical" }
-                    Button("High") { priorityFilter = "high" }
-                    Button("Medium") { priorityFilter = "medium" }
-                    Button("Low") { priorityFilter = "low" }
-                } label: {
-                    HStack(spacing: 4) {
-                        Image(systemName: "line.3.horizontal.decrease")
-                            .font(.caption)
-                        Text(priorityFilter == "all" ? "Priority" : priorityFilter.capitalized)
-                            .font(.caption)
+                    if isBoard {
+                        Picker("Group By", selection: $boardGrouping) {
+                            ForEach(ActionItemBoardGrouping.allCases) { Text($0.title).tag($0) }
+                        }
+                        .pickerStyle(.inline)
+                        Toggle("Waiting Column", isOn: $showWaiting)
+                    } else {
+                        Toggle("Show Completed", isOn: $showCompleted)
                     }
-                    .padding(.horizontal, 10)
-                    .padding(.vertical, 6)
+                    Divider()
+                    Picker("Priority", selection: $priorityFilter) {
+                        Text("Any Priority").tag("all")
+                        Text("Urgent").tag("urgent")
+                        Divider()
+                        Text("Critical").tag("critical")
+                        Text("High").tag("high")
+                        Text("Medium").tag("medium")
+                        Text("Low").tag("low")
+                    }
+                    .pickerStyle(.inline)
+                    if isFiltered {
+                        Divider()
+                        Button("Reset Filters") {
+                            showCompleted = false
+                            priorityFilter = "all"
+                        }
+                    }
+                } label: {
+                    Label("Filter", systemImage: isFiltered
+                          ? "line.3.horizontal.decrease.circle.fill"
+                          : "line.3.horizontal.decrease.circle")
                 }
-                .menuStyle(.borderlessButton)
-                .glassEffect(priorityFilter != "all" ? .regular.tint(.orange.opacity(0.3)) : .regular, in: .capsule)
+                .menuIndicator(.hidden)
                 .fixedSize()
+                .help("Show completed items or filter by priority")
 
-                Spacer()
+                Spacer(minLength: 8)
 
-                Button(isSyncingToNotion ? "Sending..." : "Send Visible to Notion") {
-                    Task { await syncVisibleItemsToNotion() }
-                }
-                .buttonStyle(.glass)
-                .disabled(isSyncingToNotion || filteredItems.isEmpty)
-
-                Button(isDispatching ? "Sending..." : "Send All Confirmed") {
-                    Task { await dispatchConfirmedItems() }
-                }
-                .buttonStyle(.glass)
-                .disabled(isDispatching || confirmedItems.isEmpty)
-
-                Text("\(filteredItems.filter { !$0.0.isCompleted }.count) open")
+                Text("\(openCount) open")
                     .font(.subheadline)
                     .foregroundStyle(.secondary)
+                    .monospacedDigit()
+
+                if canSendToNotion || !confirmedItems.isEmpty {
+                    Menu {
+                        if !confirmedItems.isEmpty {
+                            Button("Send \(confirmedItems.count) Confirmed \(confirmedItems.count == 1 ? "Item" : "Items")") {
+                                Task { await dispatchConfirmedItems() }
+                            }
+                            .disabled(isDispatching)
+                        }
+                        if canSendToNotion {
+                            Button("Send \(filteredItems.count) Shown to Notion") {
+                                Task { await syncVisibleItemsToNotion() }
+                            }
+                            .disabled(isSyncingToNotion || filteredItems.isEmpty)
+                        }
+                    } label: {
+                        if isDispatching || isSyncingToNotion {
+                            ProgressView().controlSize(.small)
+                        } else {
+                            Label("Send", systemImage: "paperplane")
+                        }
+                    }
+                    .menuIndicator(.hidden)
+                    .fixedSize()
+                    .disabled(settings.localOnlyMode)
+                    .help(settings.localOnlyMode
+                          ? "Sending is off in Local-only mode"
+                          : "Send action items to Notion, Reminders or your other destinations")
+                }
             }
-            .padding()
+            .padding(.horizontal)
+            .padding(.vertical, 10)
 
             Divider()
 
+            if isBoard {
+                ActionItemBoardView(
+                    rows: filtered(includeCompleted: true),
+                    grouping: boardGrouping,
+                    showWaiting: showWaiting,
+                    onOpenMeeting: { selectedMeeting = $0 },
+                    onDelete: { item, meeting in deleteActionItem(item, from: meeting) }
+                )
+            } else {
+                list
+            }
+        }
+        .navigationTitle("Action Items")
+        .task(id: IntentRuntime.fingerprint(filtered(includeCompleted: false))) { refreshIntents() }
+        #if DEBUG
+        .onAppear { MainWindowSnapshotDriver.shared?.actionItemsFilter = { filterText = $0 } }
+        #endif
+        .sheet(item: $intentSheet) { sheet in
+            IntentConfirmSheet(intent: sheet.intent, item: sheet.item, meeting: sheet.meeting)
+        }
+        .alert(alertTitle, isPresented: Binding(
+            get: { alertMessage != nil },
+            set: { if !$0 { alertMessage = nil } }
+        )) {
+            Button("OK", role: .cancel) {}
+        } message: {
+            Text(alertMessage ?? "")
+        }
+    }
+
+    private var list: some View {
             List {
                 ForEach(filteredItems, id: \.0.id) { item, meeting in
-                    EditableActionItemRow(
-                        item: item,
-                        meetingTitle: meeting.title,
-                        onSelectMeeting: {
-                            selectedMeeting = meeting
-                        },
-                        onDelete: {
-                            deleteActionItem(item, from: meeting)
+                    VStack(alignment: .leading, spacing: 4) {
+                        EditableActionItemRow(
+                            item: item,
+                            meetingTitle: meeting.title,
+                            onSelectMeeting: {
+                                selectedMeeting = meeting
+                            },
+                            onDelete: {
+                                deleteActionItem(item, from: meeting)
+                            }
+                        )
+                        if !item.isCompleted {
+                            IntentSummaryView(
+                                item: item, meeting: meeting, compact: true,
+                                onDismissItem: { deleteActionItem(item, from: meeting) },
+                                onOpen: { intentSheet = IntentSheetItem(intent: $0, item: item, meeting: meeting) }
+                            )
+                            .padding(.leading, 34)
+                            .padding(.bottom, 4)
                         }
-                    )
+                    }
                     .listRowInsets(EdgeInsets(top: 2, leading: 16, bottom: 2, trailing: 16))
                     .listRowSeparator(.hidden)
                     .background {
@@ -194,22 +298,18 @@ struct ActionItemDashboardView: View {
                     ContentUnavailableView(
                         "No Action Items",
                         systemImage: "checkmark.circle",
-                        description: Text("Type below to add one, or record a meeting to extract them automatically")
+                        description: Text(filterText.isEmpty ? "Add one above, or record a meeting and LidIA picks them out for you." : "No action items match \u{201C}\(filterText)\u{201D}.")
                     )
                 }
             }
-        }
-        .navigationTitle("Action Items")
-        .onAppear { cachedActionItems = computeAllActionItems() }
-        .onChange(of: meetings) { cachedActionItems = computeAllActionItems() }
-        .alert(alertTitle, isPresented: Binding(
-            get: { alertMessage != nil },
-            set: { if !$0 { alertMessage = nil } }
-        )) {
-            Button("OK", role: .cancel) {}
-        } message: {
-            Text(alertMessage ?? "")
-        }
+    }
+
+    private var isFiltered: Bool { showCompleted || priorityFilter != "all" }
+
+    private var openCount: Int { filteredItems.filter { !$0.0.isCompleted }.count }
+
+    private var canSendToNotion: Bool {
+        !settings.notionAPIKey.isEmpty && !settings.notionTasksDatabaseID.isEmpty
     }
 
     private var confirmedItems: [(ActionItem, Meeting)] {
@@ -236,14 +336,12 @@ struct ActionItemDashboardView: View {
         targetMeeting.actionItems.append(newItem)
         try? modelContext.save()
         newActionItemTitle = ""
-        cachedActionItems = computeAllActionItems()
     }
 
     private func deleteActionItem(_ item: ActionItem, from meeting: Meeting) {
         meeting.actionItems.removeAll { $0.id == item.id }
         modelContext.delete(item)
         try? modelContext.save()
-        cachedActionItems = computeAllActionItems()
     }
 
     @MainActor
@@ -276,14 +374,6 @@ struct ActionItemDashboardView: View {
             if failCount > 0 { msg += " \(failCount) failed." }
             alertMessage = msg
         }
-    }
-
-    private func computeAllActionItems() -> [(ActionItem, Meeting)] {
-        meetings
-            .filter { $0.status == .complete }
-            .flatMap { meeting in
-                meeting.actionItems.map { ($0, meeting) }
-            }
     }
 
     @MainActor

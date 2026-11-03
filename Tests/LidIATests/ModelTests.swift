@@ -56,6 +56,12 @@ import SwiftData
     #expect(item.deadlineDate == nil)
     #expect(item.deadline == nil)
     #expect(item.displayDeadline == nil)
+
+    // A model's JSON null saved as text never shows as a deadline.
+    item.deadline = "null"
+    #expect(item.displayDeadline == nil)
+    item.deadline = " Friday "
+    #expect(item.displayDeadline == "Friday")
 }
 
 @Test func transcriptWordCoding() async throws {

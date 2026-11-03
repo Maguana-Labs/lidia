@@ -5,6 +5,12 @@ struct SetupWizardView: View {
     @Environment(AppSettings.self) private var settings
     @Environment(ModelManager.self) private var modelManager
     @Environment(TTSModelManager.self) private var ttsModelManager
+    @Environment(\.openSettings) private var openSettings
+
+    /// The on-device model recommended for this Mac's memory.
+    private var recommendedLLM: ModelCatalogEntry { ModelCatalog.recommendedForThisMac }
+    private var appleIntelligenceReady: Bool { AppleFoundationClient.availability == .available }
+    private var llmInstalled: Bool { modelManager.isDownloaded(recommendedLLM.id) || !modelManager.downloadedEntries.isEmpty }
 
     enum Step {
         case welcome
@@ -54,7 +60,7 @@ struct SetupWizardView: View {
             if parakeetModelsExist {
                 downloadParakeet = false
             }
-            if modelManager.isModelLoaded {
+            if llmInstalled || modelManager.preflight(recommendedLLM.id) != nil {
                 downloadLLM = false
             }
             if ttsModelManager.isTTSModelAvailable {
@@ -96,9 +102,9 @@ struct SetupWizardView: View {
                         isOn: $downloadLLM,
                         icon: "text.badge.star",
                         iconColor: .orange,
-                        title: ModelManager.defaultModel.name,
-                        subtitle: "Language model for summaries & action items (~\(String(format: "%.1f", ModelManager.defaultModel.sizeGB)) GB)",
-                        alreadyDownloaded: modelManager.isModelLoaded
+                        title: "Summaries on this Mac — \(recommendedLLM.displayName)",
+                        subtitle: llmSubtitle,
+                        alreadyDownloaded: llmInstalled
                     )
 
                     modelToggle(
@@ -124,21 +130,40 @@ struct SetupWizardView: View {
                 .buttonStyle(.glassProminent)
                 .controlSize(.large)
 
-                if selectedCount > 0 {
-                    Button("Skip — I have my own API keys") {
-                        settings.hasCompletedSetup = true
-                    }
-                    .buttonStyle(.plain)
-                    .foregroundStyle(.secondary)
-                    .font(.caption)
-
-                    Text("Cerebras offers a free tier (1M tokens/day). DeepSeek and NVIDIA NIM are also supported.")
-                        .font(.caption2)
-                        .foregroundStyle(.tertiary)
-                        .multilineTextAlignment(.center)
+                Button("Use a cloud provider instead") {
+                    useCloudProvider()
                 }
+                .buttonStyle(.plain)
+                .foregroundStyle(.secondary)
+                .font(.caption)
+
+                Text("Cloud providers use your own API key, and meeting data is sent to them. You can switch any time in Settings → AI.")
+                    .font(.caption2)
+                    .foregroundStyle(.tertiary)
+                    .multilineTextAlignment(.center)
             }
         }
+    }
+
+    /// "5.2 GB, fits your 16 GB Mac. Apple Intelligence handles summaries until it's ready."
+    private var llmSubtitle: String {
+        let size = String(format: "%.1f GB", recommendedLLM.downloadGB)
+        let memory = Int((Double(ProcessInfo.processInfo.physicalMemory) / 1_073_741_824).rounded())
+        if let problem = modelManager.preflight(recommendedLLM.id) {
+            return problem.localizedDescription
+        }
+        if appleIntelligenceReady {
+            return "\(size), fits your \(memory) GB Mac. Summaries work now with Apple Intelligence; this download makes them better and takes over when it's ready."
+        }
+        return "\(size), fits your \(memory) GB Mac. Needed for summaries and action items on this Mac."
+    }
+
+    /// Skip local models and pick a cloud provider in Settings.
+    private func useCloudProvider() {
+        cancelAll()
+        settings.llmProvider = .automaticLocal
+        settings.hasCompletedSetup = true
+        openSettings()
     }
 
     private func modelToggle(
@@ -195,14 +220,7 @@ struct SetupWizardView: View {
             Text(currentDownloadLabel)
                 .font(.title2.bold())
 
-            if currentDownloadLabel.contains("LLM") || currentDownloadLabel.contains(ModelManager.defaultModel.name) {
-                ProgressView(value: modelManager.downloadProgress)
-                    .frame(maxWidth: 300)
-
-                Text("\(Int(modelManager.downloadProgress * 100))%")
-                    .font(.title3.monospacedDigit())
-                    .foregroundStyle(.secondary)
-            } else if currentDownloadLabel.contains("TTS") {
+            if currentDownloadLabel.contains("TTS") {
                 if ttsModelManager.downloadProgress > 0 && ttsModelManager.downloadProgress < 1 {
                     ProgressView(value: ttsModelManager.downloadProgress)
                         .frame(maxWidth: 300)
@@ -240,24 +258,7 @@ struct SetupWizardView: View {
                 }
             }
 
-            if let error = modelManager.downloadError {
-                Text(error)
-                    .font(.caption)
-                    .foregroundStyle(.red)
-
-                HStack(spacing: 10) {
-                    Button("Retry") {
-                        startDownloads()
-                    }
-                    .buttonStyle(.glass)
-
-                    Button("Skip and continue") {
-                        downloadLLM = false
-                        startDownloads()
-                    }
-                    .buttonStyle(.glass)
-                }
-            }
+            llmBackgroundStatus
 
             if let error = ttsModelManager.downloadError {
                 Text(error)
@@ -296,8 +297,47 @@ struct SetupWizardView: View {
         }
     }
 
+    /// Progress of the on-device model, which downloads in the background
+    /// while the other steps run and after setup finishes.
+    @ViewBuilder
+    private var llmBackgroundStatus: some View {
+        if let status = modelManager.downloadStatus, status.modelID == recommendedLLM.id {
+            VStack(spacing: 6) {
+                switch status.phase {
+                case .failed(let message):
+                    Text(message)
+                        .font(.caption)
+                        .foregroundStyle(.red)
+                        .multilineTextAlignment(.center)
+                    HStack(spacing: 10) {
+                        Button("Retry \(recommendedLLM.displayName)") {
+                            modelManager.downloadModel(recommendedLLM.id)
+                        }
+                        .buttonStyle(.glass)
+                        Button("Skip") { downloadLLM = false }
+                            .buttonStyle(.glass)
+                    }
+                case .finished:
+                    Label("\(recommendedLLM.displayName) ready for summaries", systemImage: "checkmark.circle")
+                        .font(.caption)
+                        .foregroundStyle(.green)
+                default:
+                    Text("\(recommendedLLM.displayName) (in the background)")
+                        .font(.caption.bold())
+                    ProgressView(value: status.fraction)
+                        .frame(maxWidth: 300)
+                    Text(status.phase == .verifying ? "Verifying files\u{2026}" : status.progressDescription)
+                        .font(.caption2.monospacedDigit())
+                        .foregroundStyle(.secondary)
+                }
+            }
+            .padding(.top, 8)
+        }
+    }
+
     private func cancelAll() {
-        modelManager.cancelDownload()
+        // The on-device model keeps downloading in the background: it is
+        // resumable and finishing it is what makes summaries work.
         // TTS and Parakeet downloads run via async APIs without cancel handles today;
         // task is implicitly cancelled when step changes, but we surface the intent.
         parakeetError = nil
@@ -319,9 +359,23 @@ struct SetupWizardView: View {
                     Label("Parakeet TDT ready for transcription", systemImage: "checkmark.circle")
                         .foregroundStyle(.green)
                 }
-                if modelManager.isModelLoaded {
-                    Label("\(ModelManager.defaultModel.name) ready for summaries", systemImage: "checkmark.circle")
+                if llmInstalled {
+                    Label("\(recommendedLLM.displayName) ready for summaries", systemImage: "checkmark.circle")
                         .foregroundStyle(.green)
+                } else if modelManager.downloadStatus?.isActive == true {
+                    Label(
+                        appleIntelligenceReady
+                            ? "\(recommendedLLM.displayName) is downloading; Apple Intelligence handles summaries until it's ready"
+                            : "\(recommendedLLM.displayName) is downloading; summaries start when it's ready",
+                        systemImage: "arrow.down.circle"
+                    )
+                    .foregroundStyle(.secondary)
+                } else if appleIntelligenceReady {
+                    Label("Apple Intelligence ready for summaries", systemImage: "checkmark.circle")
+                        .foregroundStyle(.green)
+                } else {
+                    Label("Summaries need an on-device model or a cloud provider. Set one up in Settings → AI.", systemImage: "exclamationmark.circle")
+                        .foregroundStyle(.orange)
                 }
                 if ttsModelManager.isTTSModelAvailable {
                     Label("\(defaultTTSModel.name) ready for voice assistant", systemImage: "checkmark.circle")
@@ -330,16 +384,17 @@ struct SetupWizardView: View {
             }
             .font(.subheadline)
 
+            llmBackgroundStatus
+
             Text("Everything runs locally on your Mac. No data leaves your device.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
                 .multilineTextAlignment(.center)
 
             Button("Start Using LidIA") {
-                if modelManager.isModelLoaded {
-                    settings.llmProvider = .mlx
-                    settings.selectedMLXModelID = ModelManager.defaultModel.id
-                }
+                // Automatic on-device AI: the downloaded model when present,
+                // Apple Intelligence until then. Never Ollama.
+                settings.llmProvider = .automaticLocal
                 settings.hasCompletedSetup = true
             }
             .buttonStyle(.glassProminent)
@@ -350,13 +405,28 @@ struct SetupWizardView: View {
     // MARK: - Download Orchestration
 
     private func startDownloads() {
-        let steps = selectedCount
-        guard steps > 0 else {
+        guard selectedCount > 0 else {
+            settings.llmProvider = .automaticLocal
             settings.hasCompletedSetup = true
             return
         }
 
-        totalDownloadSteps = steps
+        // The on-device model downloads in the background (resumable) while
+        // the smaller downloads run; it isn't a blocking step.
+        if downloadLLM && !llmInstalled && !modelManager.isDownloading {
+            if settings.selectedMLXModelID.isEmpty {
+                settings.selectedMLXModelID = recommendedLLM.id
+            }
+            modelManager.downloadModel(recommendedLLM.id)
+        }
+
+        let blockingSteps = selectedCount - (downloadLLM ? 1 : 0)
+        guard blockingSteps > 0 else {
+            step = .ready
+            return
+        }
+
+        totalDownloadSteps = blockingSteps
         currentDownloadStep = 0
         step = .downloading
 
@@ -375,20 +445,7 @@ struct SetupWizardView: View {
                 }
             }
 
-            // Step 2: LLM (if selected)
-            if downloadLLM && !modelManager.isModelLoaded {
-                currentDownloadStep += 1
-                currentDownloadLabel = "Downloading \(ModelManager.defaultModel.name)"
-                modelManager.downloadModel(ModelManager.defaultModel.id)
-
-                // Wait for LLM download to finish
-                while modelManager.isDownloading {
-                    try? await Task.sleep(for: .milliseconds(500))
-                }
-                if modelManager.downloadError != nil { return }
-            }
-
-            // Step 3: TTS (if selected)
+            // Step 2: TTS (if selected)
             if downloadTTS && !ttsModelManager.isTTSModelAvailable {
                 currentDownloadStep += 1
                 currentDownloadLabel = "Downloading \(defaultTTSModel.name)"

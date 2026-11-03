@@ -4,12 +4,52 @@ import os
 import Speech
 import Synchronization
 
-final class AppleSpeechEngine: STTEngine {
+final class AppleSpeechEngine: STTEngine, STTFailureReporting {
     private static let logger = Logger(subsystem: "io.lidia.app", category: "AppleSpeechEngine")
     private let locale: Locale
+    private let failureReasonMutex = Mutex<String?>(nil)
+
+    var failureReason: String? {
+        failureReasonMutex.withLock { $0 }
+    }
+
+    private func fail(_ reason: String) {
+        failureReasonMutex.withLock { $0 = reason }
+    }
 
     init(locale: Locale = .current) {
         self.locale = locale
+    }
+
+    /// Whether this Mac can recognise `locale` without sending audio to Apple.
+    static func supportsOnDeviceRecognition(for locale: Locale) -> Bool {
+        SFSpeechRecognizer(locale: locale)?.supportsOnDeviceRecognition ?? false
+    }
+
+    /// Whether Apple Speech can take over live transcription on its own: on-device for
+    /// `locale` and not refused permission (an undecided permission is asked when used).
+    static func isOnDeviceFallbackAvailable(for locale: Locale) -> Bool {
+        isUsableFallback(
+            authorization: SFSpeechRecognizer.authorizationStatus(),
+            supportsOnDevice: supportsOnDeviceRecognition(for: locale)
+        )
+    }
+
+    static func isUsableFallback(authorization: SFSpeechRecognizerAuthorizationStatus, supportsOnDevice: Bool) -> Bool {
+        guard supportsOnDevice else { return false }
+        switch authorization {
+        case .authorized, .notDetermined: return true
+        case .denied, .restricted: return false
+        @unknown default: return false
+        }
+    }
+
+    /// Configures a request to stay on the device whenever the recogniser supports it.
+    /// Returns whether recognition is on-device.
+    @discardableResult
+    static func configurePrivacy(of request: SFSpeechRecognitionRequest, supportsOnDevice: Bool) -> Bool {
+        request.requiresOnDeviceRecognition = supportsOnDevice
+        return supportsOnDevice
     }
 
     func transcribe(audioStream: AsyncStream<AudioChunk>) -> AsyncStream<TranscriptWord> {
@@ -23,6 +63,7 @@ final class AppleSpeechEngine: STTEngine {
                 }
                 guard authStatus == .authorized else {
                     Self.logger.error("Speech recognition not authorized: \(authStatus.rawValue)")
+                    self.fail("Speech Recognition permission is off for LidIA in System Settings > Privacy & Security > Speech Recognition")
                     continuation.finish()
                     return
                 }
@@ -30,6 +71,15 @@ final class AppleSpeechEngine: STTEngine {
                 guard let recognizer = SFSpeechRecognizer(locale: self.locale),
                       recognizer.isAvailable else {
                     Self.logger.error("SFSpeechRecognizer unavailable for locale: \(self.locale)")
+                    self.fail("Apple Speech isn't available for \(self.locale.identifier)")
+                    continuation.finish()
+                    return
+                }
+
+                // Local-only mode: never fall back to Apple's servers.
+                if PrivacyGate.isLocalOnly && !recognizer.supportsOnDeviceRecognition {
+                    Self.logger.error("Apple Speech: on-device recognition unavailable for \(self.locale.identifier) and Local-only mode is on; not transcribing")
+                    self.fail("on-device recognition isn't available for \(self.locale.identifier) and Local-only mode is on")
                     continuation.finish()
                     return
                 }
@@ -37,15 +87,27 @@ final class AppleSpeechEngine: STTEngine {
                 let request = SFSpeechAudioBufferRecognitionRequest()
                 request.shouldReportPartialResults = true
                 request.addsPunctuation = true
+                // Keep meeting audio on the Mac. On-device recognition also has no
+                // one-minute limit, which server recognition has.
+                if Self.configurePrivacy(of: request, supportsOnDevice: recognizer.supportsOnDeviceRecognition) {
+                    Self.logger.info("Apple Speech: on-device recognition for \(self.locale.identifier)")
+                } else {
+                    Self.logger.warning("Apple Speech: on-device recognition unavailable for \(self.locale.identifier); audio will be sent to Apple")
+                }
+
+                // Signalled when recognition ends (final result or error).
+                let (doneStream, doneContinuation) = AsyncStream.makeStream(of: Void.self)
 
                 let lastWordCount = Mutex(0)
                 var chunkCount = 0
+                var fedSeconds: TimeInterval = 0
                 var cachedFormat: AVAudioFormat?
 
                 let task = recognizer.recognitionTask(with: request) { result, error in
                     guard let result else {
                         if let error {
                             AppleSpeechEngine.logger.error("Recognition error: \(error.localizedDescription)")
+                            doneContinuation.finish()
                         }
                         return
                     }
@@ -70,7 +132,7 @@ final class AppleSpeechEngine: STTEngine {
                     }
 
                     if result.isFinal {
-                        continuation.finish()
+                        doneContinuation.finish()
                     }
                 }
 
@@ -110,11 +172,21 @@ final class AppleSpeechEngine: STTEngine {
                     }
 
                     request.append(buffer)
+                    fedSeconds += chunk.duration
                 }
 
                 Self.logger.info("Audio stream ended, finalizing recognition...")
                 request.endAudio()
-                try? await Task.sleep(for: .seconds(3))
+                // Wait for the final result instead of a fixed delay, so the last words
+                // (or a whole recording fed at once) aren't cut off. The timeout only
+                // matters if the recogniser never reports back.
+                let timeout = 10 + fedSeconds / 4
+                await withTaskGroup(of: Void.self) { group in
+                    group.addTask { for await _ in doneStream {} }
+                    group.addTask { try? await Task.sleep(for: .seconds(timeout)) }
+                    await group.next()
+                    group.cancelAll()
+                }
                 task.cancel()
                 continuation.finish()
             }

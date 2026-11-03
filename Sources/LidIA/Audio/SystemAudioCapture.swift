@@ -104,7 +104,8 @@ final class SystemAudioCapture: NSObject, SCStreamOutput, SCStreamDelegate {
     private nonisolated func handleAudioBuffer(_ sampleBuffer: CMSampleBuffer, source: AudioSource) {
         do {
             try sampleBuffer.withAudioBufferList { audioBufferList, _ in
-                guard let description = sampleBuffer.formatDescription?.audioStreamBasicDescription else { return }
+                guard let description = sampleBuffer.formatDescription?.audioStreamBasicDescription,
+                      description.mSampleRate > 0 else { return }
 
                 let sampleRate = Int(description.mSampleRate)
                 let bufferPointer = audioBufferList.unsafePointer
@@ -114,12 +115,19 @@ final class SystemAudioCapture: NSObject, SCStreamOutput, SCStreamDelegate {
 
                 let audioBuffer = bufferPointer.pointee.mBuffers
                 guard let data = audioBuffer.mData else { return }
-                let frameCount = Int(audioBuffer.mDataByteSize) / MemoryLayout<Float>.size
 
-                guard frameCount > 0 else { return }
-
-                let floatPointer = data.assumingMemoryBound(to: Float.self)
-                let samples = Array(UnsafeBufferPointer(start: floatPointer, count: frameCount))
+                // Float32 is the usual format; integer PCM is converted rather than
+                // dropped, so an unexpected format can't silence a whole side.
+                guard let samples = PCMSampleDecoder.decode(
+                    UnsafeRawPointer(data),
+                    byteCount: Int(audioBuffer.mDataByteSize),
+                    format: description,
+                    channelsInBuffer: Int(audioBuffer.mNumberChannels)
+                ) else {
+                    Self.logUnsupportedFormatOnce(description, source: source)
+                    return
+                }
+                guard !samples.isEmpty else { return }
 
                 let chunk = AudioChunk(
                     samples: samples,
@@ -148,6 +156,19 @@ final class SystemAudioCapture: NSObject, SCStreamOutput, SCStreamDelegate {
         } catch {
             // Skip malformed buffers
         }
+    }
+
+    private nonisolated static let loggedUnsupportedFormat = OSAllocatedUnfairLock(initialState: false)
+
+    private nonisolated static func logUnsupportedFormatOnce(_ format: AudioStreamBasicDescription, source: AudioSource) {
+        let first = loggedUnsupportedFormat.withLock { logged -> Bool in
+            defer { logged = true }
+            return !logged
+        }
+        guard first else { return }
+        Logger(subsystem: "io.lidia.app", category: "SystemAudioCapture").error(
+            "Unsupported \(source.rawValue, privacy: .public) audio format: id=\(format.mFormatID) flags=\(format.mFormatFlags) bits=\(format.mBitsPerChannel) channels=\(format.mChannelsPerFrame); dropping buffers"
+        )
     }
 
     // MARK: - SCStreamDelegate

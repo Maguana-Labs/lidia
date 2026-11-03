@@ -1,124 +1,174 @@
 import SwiftUI
 
+/// The live transcript as Granola shows it: one paragraph bubble per run of a speaker with
+/// a timestamp, the current guess refining in place (lighter) at the end, and "…" while
+/// someone speaks before words appear. Final text only grows at the end, so nothing jumps.
 struct LiveTranscriptView: View {
     let words: [TranscriptWord]
-    var localSpeakerName: String = "Me"
+    var localSpeakerName: String = "You"
+    /// Room left at the bottom for the page's docked Ask field.
+    var bottomInset: CGFloat = 16
+
+    @Environment(RecordingSession.self) private var session
 
     @State private var pinnedToBottom = true
     @State private var showJumpButton = false
 
     var body: some View {
+        TimelineView(.periodic(from: .now, by: 0.25)) { context in
+            let bubbles = LiveTranscriptBubbles.bubbles(
+                words: words,
+                volatile: session.liveVolatile,
+                speaking: session.speakingSources(),
+                now: session.elapsedTime
+            )
+            content(bubbles, phase: context.date.timeIntervalSinceReferenceDate)
+        }
+    }
+
+    @ViewBuilder
+    private func content(_ bubbles: [LiveBubble], phase: TimeInterval) -> some View {
+        if bubbles.isEmpty {
+            ContentUnavailableView {
+                Label(session.isPaused ? "Paused" : "Listening…", systemImage: "waveform")
+            } description: {
+                Text(session.isPaused ? "The transcript continues when you resume." : "The transcript appears here as people speak.")
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .padding(.bottom, bottomInset)
+        } else {
+            LiveBubbleList(
+                bubbles: bubbles,
+                localName: localSpeakerName,
+                phase: phase,
+                bottomInset: bottomInset,
+                pinnedToBottom: $pinnedToBottom,
+                showJumpButton: $showJumpButton
+            )
+        }
+    }
+}
+
+/// The scrolling list; follows the newest text while you're at the bottom.
+struct LiveBubbleList: View {
+    let bubbles: [LiveBubble]
+    let localName: String
+    var phase: TimeInterval = 0
+    var bottomInset: CGFloat = 16
+    @Binding var pinnedToBottom: Bool
+    @Binding var showJumpButton: Bool
+
+    /// Changes whenever something visible at the end changes.
+    private var tailToken: String {
+        guard let last = bubbles.last else { return "" }
+        return "\(bubbles.count)-\(last.text.count)-\(last.volatileText.count)-\(last.isTyping)"
+    }
+
+    var body: some View {
         ScrollViewReader { proxy in
             ZStack(alignment: .bottomTrailing) {
                 ScrollView {
-                    LazyVStack(spacing: 6) {
-                        ForEach(Array(utterances.enumerated()), id: \.offset) { index, utterance in
-                            utteranceBubble(utterance)
-                                .id("utterance-\(index)")
+                    LazyVStack(alignment: .leading, spacing: 14) {
+                        ForEach(bubbles) { bubble in
+                            LiveBubbleView(bubble: bubble, localName: localName, phase: phase)
+                                .id(bubble.id)
                         }
+                        Color.clear.frame(height: 1).id("live-bottom")
                     }
-                    .id("transcript-bottom")
+                    .padding(.horizontal, 18)
+                    .padding(.top, 12)
+                    .padding(.bottom, bottomInset)
                 }
                 .onScrollGeometryChange(for: Bool.self) { geo in
                     let maxOffset = max(0, geo.contentSize.height - geo.containerSize.height)
-                    return (maxOffset - geo.contentOffset.y) < 40
+                    return (maxOffset - geo.contentOffset.y) < 48
                 } action: { _, isPinned in
                     pinnedToBottom = isPinned
                     if isPinned { showJumpButton = false }
                 }
-                .onChange(of: words.count) {
+                .onChange(of: tailToken) {
                     guard pinnedToBottom else {
-                        if !words.isEmpty { showJumpButton = true }
+                        showJumpButton = true
                         return
                     }
-                    withAnimation {
-                        proxy.scrollTo("transcript-bottom", anchor: .bottom)
+                    withAnimation(.easeOut(duration: 0.15)) {
+                        proxy.scrollTo("live-bottom", anchor: .bottom)
                     }
                 }
+                .onAppear { proxy.scrollTo("live-bottom", anchor: .bottom) }
 
                 if showJumpButton {
                     Button {
-                        withAnimation {
-                            proxy.scrollTo("transcript-bottom", anchor: .bottom)
-                        }
+                        withAnimation { proxy.scrollTo("live-bottom", anchor: .bottom) }
                         showJumpButton = false
                     } label: {
-                        Label("Jump to latest", systemImage: "arrow.down.circle.fill")
-                            .labelStyle(.titleAndIcon)
+                        Label("Jump to latest", systemImage: "arrow.down")
                             .font(.caption.weight(.medium))
                     }
-                    .buttonStyle(.glassProminent)
-                    .padding(12)
-                    .transition(.opacity.combined(with: .scale(scale: 0.9)))
+                    .buttonStyle(.glass)
+                    .padding(.trailing, 14)
+                    .padding(.bottom, bottomInset + 6)
+                    .transition(.opacity)
                 }
             }
             .animation(.easeInOut(duration: 0.18), value: showJumpButton)
         }
     }
+}
 
-    private struct Utterance {
-        let text: String
-        let isLocal: Bool?
-        let speakerName: String
-    }
+/// One speaker's paragraph: "You · 0:41" above, the text in a soft bubble.
+struct LiveBubbleView: View {
+    let bubble: LiveBubble
+    let localName: String
+    var phase: TimeInterval = 0
 
-    private var utterances: [Utterance] {
-        guard !words.isEmpty else { return [] }
-
-        var result: [Utterance] = []
-        var currentWords: [String] = []
-        var currentIsLocal: Bool? = words[0].isLocalSpeaker
-        var lastTimestamp: TimeInterval = words[0].end
-
-        for word in words {
-            let gap = word.start - lastTimestamp
-            // Only split on speaker change if there's a meaningful gap (>1.5s)
-            // to avoid splitting on every interleaved mic/system word in dual-stream
-            let speakerChanged = word.isLocalSpeaker != currentIsLocal && gap > 1.5
-            let gapTooLong = gap > 2.0
-            let tooManyWords = currentWords.count >= 50
-
-            if (speakerChanged || gapTooLong || tooManyWords) && !currentWords.isEmpty {
-                result.append(Utterance(
-                    text: currentWords.joined(separator: " "),
-                    isLocal: currentIsLocal,
-                    speakerName: currentIsLocal == true ? localSpeakerName : "Others"
-                ))
-                currentWords.removeAll(keepingCapacity: true)
-                currentIsLocal = word.isLocalSpeaker
+    var body: some View {
+        VStack(alignment: bubble.isLocal ? .trailing : .leading, spacing: 4) {
+            HStack(spacing: 6) {
+                Text(bubble.label(localName: localName))
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(bubble.isLocal ? Color.accentColor : Color.secondary)
+                Text(TranscriptSegmenter.formatTimestamp(bubble.start))
+                    .font(.caption.monospacedDigit())
+                    .foregroundStyle(.tertiary)
             }
-
-            currentWords.append(word.word)
-            lastTimestamp = word.end
+            bubbleText
+                .font(.body)
+                .lineSpacing(2)
+                .textSelection(.enabled)
+                .padding(.horizontal, 12)
+                .padding(.vertical, 8)
+                .background(
+                    bubble.isLocal ? Color.accentColor.opacity(0.12) : Color.primary.opacity(0.055),
+                    in: RoundedRectangle(cornerRadius: 14, style: .continuous)
+                )
         }
-
-        if !currentWords.isEmpty {
-            result.append(Utterance(
-                text: currentWords.joined(separator: " "),
-                isLocal: currentIsLocal,
-                speakerName: currentIsLocal == true ? localSpeakerName : "Others"
-            ))
-        }
-
-        return result
+        .frame(maxWidth: .infinity, alignment: bubble.isLocal ? .trailing : .leading)
+        .padding(bubble.isLocal ? .leading : .trailing, 36)
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("\(bubble.label(localName: localName)), \(TranscriptSegmenter.formatTimestamp(bubble.start)): \(bubble.text) \(bubble.volatileText)")
     }
 
-    private func utteranceBubble(_ utterance: Utterance) -> some View {
-        let isLocal = utterance.isLocal == true
-        let color: Color = isLocal ? .blue : .secondary
-
-        return VStack(alignment: isLocal ? .trailing : .leading, spacing: 2) {
-            Text(utterance.speakerName)
-                .font(.caption2.bold())
-                .foregroundStyle(color.opacity(0.7))
-
-            Text(utterance.text)
-                .font(.body)
-                .textSelection(.enabled)
-                .padding(.vertical, 6)
-                .padding(.horizontal, 10)
-                .background(color.opacity(0.1), in: RoundedRectangle(cornerRadius: 12))
+    /// Final text, then the guess (lighter), then the typing dots.
+    private var bubbleText: Text {
+        var text = Text(bubble.text)
+        if !bubble.volatileText.isEmpty {
+            text = text + Text((bubble.text.isEmpty ? "" : " ") + bubble.volatileText).foregroundStyle(.secondary)
         }
-        .frame(maxWidth: .infinity, alignment: isLocal ? .trailing : .leading)
+        if bubble.isTyping {
+            let spacer = bubble.text.isEmpty && bubble.volatileText.isEmpty ? "" : " "
+            text = text + Text(spacer) + typingDots
+        }
+        return text
+    }
+
+    /// "• • •" pulsing left to right.
+    private var typingDots: Text {
+        let step = Int(phase * 3) % 3
+        return (0..<3).reduce(Text("")) { result, index in
+            result + Text(index == 0 ? "●" : " ●")
+                .font(.system(size: 7))
+                .foregroundStyle(Color.secondary.opacity(index == step ? 0.9 : 0.35))
+        }
     }
 }

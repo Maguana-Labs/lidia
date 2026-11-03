@@ -58,9 +58,9 @@ struct HotkeyRecorderRow: View {
             // Ignore bare modifier keys
             guard event.keyCode != 0xFF else { return nil }
 
-            let mods = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
-            // Require at least one modifier
-            guard !mods.isEmpty else {
+            let mods = event.modifierFlags.intersection([.command, .option, .control, .shift])
+            // Require ⌘, ⌥ or ⌃: ⇧ alone (or nothing) would fire while typing.
+            guard !mods.intersection([.command, .option, .control]).isEmpty else {
                 // Allow Escape to cancel
                 if event.keyCode == 53 {
                     stopRecording()

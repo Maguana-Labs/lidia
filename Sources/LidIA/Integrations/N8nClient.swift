@@ -52,8 +52,9 @@ actor N8nClient {
         webhookURL: String,
         authHeader: String?
     ) async {
+        guard PrivacyGate.allows(.n8n) else { return }
         guard let url = URL(string: webhookURL) else {
-            logger.error("n8n: invalid webhook URL: \(webhookURL)")
+            logger.error("n8n: invalid webhook URL")
             return
         }
 
@@ -90,8 +91,9 @@ actor N8nClient {
         webhookURL: String,
         authHeader: String?
     ) async -> Bool {
+        guard PrivacyGate.allows(.n8n) else { return false }
         guard let url = URL(string: webhookURL) else {
-            logger.error("n8n: invalid dispatch webhook URL: \(webhookURL)")
+            logger.error("n8n: invalid dispatch webhook URL")
             return false
         }
 

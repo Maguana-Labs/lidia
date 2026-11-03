@@ -113,20 +113,33 @@ final class MeetingDetector {
 
     // MARK: - Core Detection Logic
 
+    /// Title of a calendar meeting happening now (with others invited or a call link), if
+    /// any. Set by the app; lets a browser or unknown app on the mic count as a meeting.
+    var calendarMeetingNow: @MainActor () -> String? = { nil }
+
+    /// Stops offering to record meetings in this app ("Never for this app").
+    func neverDetect(bundleID: String) {
+        MeetingAppRules.ignore(bundleID)
+        Self.logger.info("Meeting detection off for \(bundleID, privacy: .public)")
+        dismiss()
+    }
+
     /// Evaluates whether a call is happening: mic + speaker both active = two-way conversation.
     private func evaluateCallState() {
         if micActive && outputActive {
-            // Both active — likely a call. Wait briefly to filter out transient activations.
+            // Both active — maybe a call. Wait briefly to filter out transient activations,
+            // then check which app it is; keep checking while the mic stays on, because a
+            // meeting app can join after something else (an assistant) opened the mic.
             if detectedApp == nil && !isDismissed && confirmationTask == nil {
                 confirmationTask = Task {
                     try? await Task.sleep(for: .seconds(2))
-                    guard !Task.isCancelled else { return }
-                    // Re-check after grace period
-                    if self.micActive && self.outputActive && self.detectedApp == nil && !self.isDismissed {
-                        let app = self.identifyActiveApp()
-                        self.detectedApp = app
-                        self.isDismissed = false
-                        Self.logger.info("Call detected: \(app.name) (\(app.bundleID))")
+                    while !Task.isCancelled, self.micActive, self.outputActive, self.detectedApp == nil, !self.isDismissed {
+                        if let app = self.identifyMeeting() {
+                            self.detectedApp = app
+                            Self.logger.info("Meeting detected: \(app.name, privacy: .public) (\(app.bundleID, privacy: .public))")
+                            break
+                        }
+                        try? await Task.sleep(for: .seconds(5))
                     }
                     self.confirmationTask = nil
                 }
@@ -144,42 +157,91 @@ final class MeetingDetector {
         }
     }
 
-    /// Try to identify which app is driving the call.
-    /// Uses the frontmost app as a reasonable heuristic — during a call, the meeting app
-    /// is usually in focus. Falls back to a generic label.
-    private func identifyActiveApp() -> DetectedApp {
-        // Check frontmost app first
-        if let front = NSWorkspace.shared.frontmostApplication,
-           let bundleID = front.bundleIdentifier,
-           bundleID != Self.selfBundleID {
-            let name = front.localizedName ?? bundleID
-            return DetectedApp(name: name, bundleID: bundleID, pid: front.processIdentifier)
+    /// The meeting on the mic, by `MeetingAppRules`, or nil when the mic is used by
+    /// something that isn't a meeting (an AI assistant, dictation, a recorder).
+    private func identifyMeeting() -> DetectedApp? {
+        var micApps = Self.bundleIDsUsingMicrophone()
+        if micApps.isEmpty, let front = NSWorkspace.shared.frontmostApplication?.bundleIdentifier {
+            // The process list isn't available: fall back to the app in front.
+            micApps = [front]
         }
-        // Fallback: scan running apps for known meeting apps
-        if let known = findKnownMeetingApp() {
-            return known
+        let browsersOnMic = Set(micApps.map(MeetingAppRules.owningApp)).filter { MeetingAppRules.browsers[$0] != nil }
+        let detection = MeetingAppRules.detect(
+            micApps: micApps,
+            windowTitles: Self.windowTitles(of: browsersOnMic),
+            calendarMeeting: calendarMeetingNow(),
+            ignored: MeetingAppRules.ignoredApps(),
+            selfBundleID: Self.selfBundleID
+        )
+        guard let detection else {
+            Self.logger.debug("Mic in use by \(micApps.joined(separator: ", "), privacy: .public): not a meeting")
+            return nil
         }
-        // Generic fallback
-        return DetectedApp(name: "Unknown App", bundleID: "unknown", pid: 0)
+        let pid = NSWorkspace.shared.runningApplications.first { $0.bundleIdentifier == detection.bundleID }?.processIdentifier ?? 0
+        return DetectedApp(name: detection.name, bundleID: detection.bundleID, pid: pid)
     }
 
-    /// Well-known meeting/call apps — used as a secondary signal to identify the app.
-    private static let knownMeetingApps: Set<String> = [
-        "us.zoom.xos",
-        "com.microsoft.teams2",
-        "com.microsoft.teams",
-        "com.tinyspeck.slackmacgap",
-        "com.google.Chrome",
-        "com.apple.Safari",
-        "com.webex.meetingmanager",
-        "com.cisco.webexmeetingsapp",
-        "com.apple.FaceTime",
-        "com.hnc.Discord",
-        "net.whatsapp.WhatsApp",
-        "com.brave.Browser",
-        "org.mozilla.firefox",
-        "com.microsoft.edgemac",
-    ]
+    /// Bundle IDs of the processes recording from any input right now (macOS 14.2+
+    /// CoreAudio process objects). Helpers keep their own IDs ("com.google.Chrome.helper").
+    private static func bundleIDsUsingMicrophone() -> [String] {
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioHardwarePropertyProcessObjectList,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        var size: UInt32 = 0
+        guard AudioObjectGetPropertyDataSize(AudioObjectID(kAudioObjectSystemObject), &address, 0, nil, &size) == noErr,
+              size > 0 else { return [] }
+        var processes = [AudioObjectID](repeating: 0, count: Int(size) / MemoryLayout<AudioObjectID>.size)
+        guard AudioObjectGetPropertyData(AudioObjectID(kAudioObjectSystemObject), &address, 0, nil, &size, &processes) == noErr else {
+            return []
+        }
+        return processes.compactMap { process -> String? in
+            var running: UInt32 = 0
+            var runningSize = UInt32(MemoryLayout<UInt32>.size)
+            var runningAddress = AudioObjectPropertyAddress(
+                mSelector: kAudioProcessPropertyIsRunningInput,
+                mScope: kAudioObjectPropertyScopeGlobal,
+                mElement: kAudioObjectPropertyElementMain
+            )
+            guard AudioObjectGetPropertyData(process, &runningAddress, 0, nil, &runningSize, &running) == noErr,
+                  running != 0 else { return nil }
+            var bundleID: Unmanaged<CFString>?
+            var idSize = UInt32(MemoryLayout<Unmanaged<CFString>?>.size)
+            var idAddress = AudioObjectPropertyAddress(
+                mSelector: kAudioProcessPropertyBundleID,
+                mScope: kAudioObjectPropertyScopeGlobal,
+                mElement: kAudioObjectPropertyElementMain
+            )
+            guard AudioObjectGetPropertyData(process, &idAddress, 0, nil, &idSize, &bundleID) == noErr,
+                  let value = bundleID?.takeRetainedValue() as String?, !value.isEmpty else { return nil }
+            return value
+        }
+    }
+
+    /// On-screen window titles of these apps (empty without Screen Recording permission).
+    private static func windowTitles(of bundleIDs: Set<String>) -> [String: [String]] {
+        guard !bundleIDs.isEmpty,
+              let windows = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[CFString: Any]] else {
+            return [:]
+        }
+        var pidToBundle: [pid_t: String] = [:]
+        for app in NSWorkspace.shared.runningApplications {
+            if let id = app.bundleIdentifier, bundleIDs.contains(id) { pidToBundle[app.processIdentifier] = id }
+        }
+        var titles: [String: [String]] = [:]
+        for window in windows {
+            guard let pid = window[kCGWindowOwnerPID] as? pid_t, let id = pidToBundle[pid],
+                  let name = window[kCGWindowName] as? String, !name.isEmpty else { continue }
+            titles[id, default: []].append(name)
+        }
+        return titles
+    }
+
+    /// Meeting apps and browsers, for following a recording's app until it closes.
+    private static var knownMeetingApps: Set<String> {
+        Set(MeetingAppRules.nativeMeetingApps.keys).union(MeetingAppRules.browsers.keys)
+    }
 
     private func findKnownMeetingApp() -> DetectedApp? {
         for app in NSWorkspace.shared.runningApplications {

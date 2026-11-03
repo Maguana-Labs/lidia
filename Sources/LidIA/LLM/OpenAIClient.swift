@@ -53,17 +53,70 @@ private struct OpenAIModelsResponse: Codable, Sendable {
 
 // MARK: - OpenAIClient
 
+/// A JSON value for request-body passthrough.
+enum JSONValue: Sendable, Equatable {
+    case string(String)
+    case number(Double)
+    case bool(Bool)
+    case object([String: JSONValue])
+    case array([JSONValue])
+    case null
+
+    var foundationValue: Any {
+        switch self {
+        case .string(let value): return value
+        case .number(let value): return value
+        case .bool(let value): return value
+        case .object(let value): return value.mapValues(\.foundationValue)
+        case .array(let value): return value.map(\.foundationValue)
+        case .null: return NSNull()
+        }
+    }
+}
+
 actor OpenAIClient: LLMClient {
     let apiKey: String
     let baseURL: URL
     let timeoutInterval: TimeInterval
     let skipModelFilter: Bool
+    /// Extra top-level fields merged into chat request bodies (e.g.
+    /// OpenRouter's `provider` routing preferences).
+    let extraBody: [String: JSONValue]
 
-    init(apiKey: String, baseURL: URL = URL(string: "https://api.openai.com/v1")!, timeoutInterval: TimeInterval = 120, skipModelFilter: Bool = false) {
+    init(
+        apiKey: String,
+        baseURL: URL = URL(string: "https://api.openai.com/v1")!,
+        timeoutInterval: TimeInterval = 120,
+        skipModelFilter: Bool = false,
+        extraBody: [String: JSONValue] = [:]
+    ) {
         self.apiKey = apiKey
         self.baseURL = baseURL
         self.timeoutInterval = timeoutInterval
         self.skipModelFilter = skipModelFilter
+        self.extraBody = extraBody
+    }
+
+    /// OpenRouter routing that refuses providers which collect data and
+    /// requires zero data retention.
+    static let openRouterZDRBody: [String: JSONValue] = [
+        "provider": .object([
+            "data_collection": .string("deny"),
+            "zdr": .bool(true),
+        ]),
+    ]
+
+    /// Encodes a request and merges `extraBody` into it.
+    static func encodeBody<T: Encodable>(_ request: T, extraBody: [String: JSONValue]) throws -> Data {
+        let data = try JSONEncoder().encode(request)
+        guard !extraBody.isEmpty,
+              var object = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            return data
+        }
+        for (key, value) in extraBody {
+            object[key] = value.foundationValue
+        }
+        return try JSONSerialization.data(withJSONObject: object, options: [.sortedKeys])
     }
 
     private static let chatModelPrefixes = ["gpt-", "o1", "o3", "o4", "claude"]
@@ -130,6 +183,7 @@ actor OpenAIClient: LLMClient {
     ]
 
     func chat(messages: [LLMChatMessage], model: String, format: LLMResponseFormat?) async throws -> String {
+        try PrivacyGate.checkAIEndpoint(baseURL, provider: baseURL.host ?? "this server")
         if apiKey.isEmpty {
             throw LLMError.authenticationError("API key not configured. Open Settings and enter your API key.")
         }
@@ -143,14 +197,14 @@ actor OpenAIClient: LLMClient {
 
         var request = OpenAIChatRequest(
             model: model,
-            messages: messages
+            messages: OutboundRedactor.prepare(messages, for: DataLocality.forHost(baseURL.host ?? ""))
         )
         if case .json = format {
             request.response_format = .init(type: "json_object")
             request.temperature = LLMTemperature.structured
         }
 
-        urlRequest.httpBody = try JSONEncoder().encode(request)
+        urlRequest.httpBody = try Self.encodeBody(request, extraBody: extraBody)
         let preparedRequest = urlRequest
 
         let (data, response) = try await withRetry {
@@ -166,6 +220,11 @@ actor OpenAIClient: LLMClient {
     }
 
     func chatStream(messages: [LLMChatMessage], model: String) async -> AsyncThrowingStream<String, Error> {
+        do {
+            try PrivacyGate.checkAIEndpoint(baseURL, provider: baseURL.host ?? "this server")
+        } catch {
+            return AsyncThrowingStream { $0.finish(throwing: error) }
+        }
         let url = baseURL.appendingPathComponent("chat/completions")
         var urlRequest = URLRequest(url: url)
         urlRequest.httpMethod = "POST"
@@ -175,14 +234,14 @@ actor OpenAIClient: LLMClient {
 
         let request = OpenAIStreamChatRequest(
             model: model,
-            messages: messages,
+            messages: OutboundRedactor.prepare(messages, for: DataLocality.forHost(baseURL.host ?? "")),
             stream: true
         )
 
         // Encode body before closure to avoid capturing mutable var
         let encodedBody: Data
         do {
-            encodedBody = try JSONEncoder().encode(request)
+            encodedBody = try Self.encodeBody(request, extraBody: extraBody)
         } catch {
             return AsyncThrowingStream { $0.finish(throwing: error) }
         }

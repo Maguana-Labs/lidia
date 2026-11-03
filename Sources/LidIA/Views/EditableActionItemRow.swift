@@ -1,3 +1,4 @@
+import LidIAAppIntents
 import SwiftData
 import SwiftUI
 
@@ -18,15 +19,21 @@ struct EditableActionItemRow: View {
     @State private var persistenceError: String?
 
     var body: some View {
+        row.siriOnscreen(item: item)
+    }
+
+    private var row: some View {
         HStack(alignment: .center, spacing: 8) {
             Button(item.isCompleted ? "Mark incomplete" : "Mark complete", systemImage: item.isCompleted ? "checkmark.circle.fill" : "circle") {
                 item.isCompleted.toggle()
                 persistChanges()
+                if item.isCompleted { SiriDonations.completed(item) }
             }
             .labelStyle(.iconOnly)
             .foregroundStyle(item.isCompleted ? .green : .secondary)
             .font(.body)
             .buttonStyle(.borderless)
+            .help(item.isCompleted ? "Mark incomplete" : "Mark complete")
 
             // Priority indicator
             if item.priority != "none" {
@@ -36,6 +43,8 @@ struct EditableActionItemRow: View {
                     .foregroundStyle(.yellow)
                     .font(.caption)
                     .frame(width: 16)
+                    .help("Due within 48 hours")
+                    .accessibilityLabel("Due within 48 hours")
             }
 
             VStack(alignment: .leading, spacing: 2) {
@@ -259,9 +268,12 @@ struct EditableActionItemRow: View {
     private func priorityBadge(_ level: String, isAutoUrgent: Bool) -> some View {
         let color = priorityColor(level, isAutoUrgent: isAutoUrgent)
         Text(priorityLabel(level))
-            .font(.system(size: 9, weight: .heavy, design: .rounded))
+            .font(.caption2.weight(.heavy))
+            .fontDesign(.rounded)
             .foregroundStyle(color)
-            .frame(width: 16)
+            .frame(minWidth: 16)
+            .help(priorityHelpText(level, isAutoUrgent: isAutoUrgent))
+            .accessibilityLabel(priorityHelpText(level, isAutoUrgent: isAutoUrgent))
     }
 
     private func priorityLabel(_ level: String) -> String {
@@ -309,17 +321,26 @@ struct EditableActionItemRow: View {
         }
 
         guard settings.remindersEnabled else { return }
+        // Copied out before the await: the row's item can be deleted meanwhile.
+        let itemID = item.id
+        let home = item.modelContext ?? modelContext
+        let currentReminderID = item.reminderID
+        let title = item.title
+        let deadlineText = item.displayDeadline
+        let deadlineDate = item.deadlineDate
+        let isCompleted = item.isCompleted
         Task { @MainActor in
             let reminderID = await eventKitManager.syncReminder(
-                reminderID: item.reminderID,
-                title: item.title,
-                deadlineText: item.displayDeadline,
-                deadlineDate: item.deadlineDate,
-                isCompleted: item.isCompleted
+                reminderID: currentReminderID,
+                title: title,
+                deadlineText: deadlineText,
+                deadlineDate: deadlineDate,
+                isCompleted: isCompleted
             )
-            if item.reminderID != reminderID {
-                item.reminderID = reminderID
-                try? modelContext.save()
+            guard let live = LiveModel.actionItem(itemID, in: home) else { return }
+            if live.reminderID != reminderID {
+                live.reminderID = reminderID
+                try? home.save()
             }
         }
     }

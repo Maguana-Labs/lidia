@@ -39,6 +39,15 @@ enum LLMError: LocalizedError {
     /// Response was technically successful but content is unusable.
     case invalidResponse(String)
 
+    /// No usable AI is configured yet (no local model downloaded, Apple
+    /// Intelligence unavailable, no cloud provider). Shown as "Finish setup".
+    case setupRequired(String)
+
+    /// The request would have sent meeting data to a cloud provider, and the
+    /// cloud gate (`allowsCloud(for:settings:)`) or the fallback policy
+    /// blocked it. `provider` is the cloud provider that was not used.
+    case cloudBlocked(provider: String, reason: String)
+
     // MARK: - Helpers
 
     /// HTTP status code when the error maps to one, otherwise -1.
@@ -82,6 +91,10 @@ enum LLMError: LocalizedError {
             return "Streaming error: \(message)"
         case .invalidResponse(let message):
             return message
+        case .setupRequired(let message):
+            return message
+        case .cloudBlocked(let provider, let reason):
+            return "Not sent to \(provider): \(reason)"
         }
     }
 }

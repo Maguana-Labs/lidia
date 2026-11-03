@@ -15,12 +15,32 @@ actor SlackClient {
         let attendees: [String]?
     }
 
+    /// Posts one message the user wrote or confirmed. Throws, unlike the
+    /// automatic summary post, so the confirmation UI can show what failed.
+    static func postText(_ text: String, channel: String, botToken: String) async throws {
+        try PrivacyGate.check(.slack)
+        guard let url = URL(string: "https://slack.com/api/chat.postMessage") else { throw URLError(.badURL) }
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.timeoutInterval = 30
+        request.setValue("application/json; charset=utf-8", forHTTPHeaderField: "Content-Type")
+        request.setValue("Bearer \(botToken)", forHTTPHeaderField: "Authorization")
+        request.httpBody = try JSONSerialization.data(withJSONObject: ["channel": channel, "text": text])
+        let (data, response) = try await URLSession.shared.data(for: request)
+        if let http = response as? HTTPURLResponse, !(200..<300).contains(http.statusCode) { throw URLError(.badServerResponse) }
+        let json = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
+        guard json?["ok"] as? Bool == true else {
+            throw DispatchError.notConfigured("Slack (\(json?["error"] as? String ?? "unknown error"))")
+        }
+    }
+
     /// Posts a formatted meeting summary to the configured Slack channel.
     /// This is fire-and-forget: errors are logged but never thrown.
     static func postMeetingSummary(
         message: SlackMessage,
         botToken: String
     ) async {
+        guard PrivacyGate.allows(.slack) else { return }
         guard let url = URL(string: "https://slack.com/api/chat.postMessage") else {
             logger.error("Slack: invalid API URL")
             return

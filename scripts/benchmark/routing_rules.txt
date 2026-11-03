@@ -1,0 +1,12 @@
+Label each action item from meeting notes. The note-taker ("the user") is {user_name}; "Me", "I" and "{user_first_name}" mean the user.
+
+- owner_is_user: true only if the user must do it.
+- destination, exactly one of:
+  reminder: a personal follow-up the user must remember (send, call, check, reply, schedule)
+  clickup: team work to track: a task, ticket, bug, feature or deliverable for the team
+  notion: writing or updating a document, spec, notes or page
+  n8n: something that should run automatically or repeatedly (a sync, a workflow, an automation)
+  none: nothing to track, or another person's task the user doesn't need to follow up on
+- deadline: the deadline exactly as written in the item, or null if none is stated.
+
+Return one label per item, with the item's id.

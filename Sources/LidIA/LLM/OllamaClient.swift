@@ -404,6 +404,7 @@ actor OllamaClient: LLMClient {
     }
 
     func chat(messages: [LLMChatMessage], model: String, format: LLMResponseFormat?) async throws -> String {
+        try PrivacyGate.checkAIEndpoint(baseURL, provider: "Ollama")
         let url = baseURL.appendingPathComponent("api/chat")
         var urlRequest = URLRequest(url: url)
         urlRequest.httpMethod = "POST"
@@ -439,6 +440,7 @@ actor OllamaClient: LLMClient {
     /// Keeps the HTTP connection alive via chunked streaming, avoiding idle timeouts
     /// on long-running Ollama generations.
     func chatViaStream(messages: [LLMChatMessage], model: String, format: LLMResponseFormat? = nil) async throws -> String {
+        try PrivacyGate.checkAIEndpoint(baseURL, provider: "Ollama")
         let url = baseURL.appendingPathComponent("api/chat")
         var urlRequest = URLRequest(url: url)
         urlRequest.httpMethod = "POST"
@@ -475,6 +477,11 @@ actor OllamaClient: LLMClient {
     }
 
     func chatStream(messages: [LLMChatMessage], model: String) async -> AsyncThrowingStream<String, Error> {
+        do {
+            try PrivacyGate.checkAIEndpoint(baseURL, provider: "Ollama")
+        } catch {
+            return AsyncThrowingStream { $0.finish(throwing: error) }
+        }
         let url = baseURL.appendingPathComponent("api/chat")
         var urlRequest = URLRequest(url: url)
         urlRequest.httpMethod = "POST"
@@ -533,6 +540,9 @@ actor OllamaClient: LLMClient {
 // MARK: - LLM Client Factory
 
 /// Creates an LLM client for a specific provider, independent of routing/settings overrides.
+///
+/// Does NOT apply the privacy rules. Only use it for requests that carry no
+/// meeting content (listing models). For anything else use `makeGatedClient`.
 @MainActor
 func makeClientForProvider(
     _ provider: AppSettings.LLMProvider,
@@ -553,9 +563,13 @@ func makeClientForProvider(
             timeoutInterval: 600,
             skipModelFilter: true
         )
+    case .automaticLocal:
+        return AutomaticLocalClient(modelManager: modelManager, preferredMLXModelID: settings.selectedMLXModelID)
+    case .appleOnDevice:
+        return AppleFoundationClient()
     case .mlx:
         guard let modelManager else { return nil }
-        return MLXLocalClient(modelManager: modelManager)
+        return MLXLocalClient(modelManager: modelManager, preferredModelID: settings.selectedMLXModelID)
     case .openai:
         return OpenAIClient(
             apiKey: settings.openaiAPIKey,
@@ -570,25 +584,105 @@ func makeClientForProvider(
     case .nvidiaNIM:
         return OpenAIClient(apiKey: settings.nvidiaAPIKey, baseURL: URL(string: "https://integrate.api.nvidia.com/v1")!, timeoutInterval: 180)
     case .openRouter:
-        return OpenAIClient(apiKey: settings.openRouterAPIKey, baseURL: URL(string: "https://openrouter.ai/api/v1")!)
+        return OpenAIClient(
+            apiKey: settings.openRouterAPIKey,
+            baseURL: URL(string: "https://openrouter.ai/api/v1")!,
+            extraBody: settings.llm.openRouterEnforceZDR ? OpenAIClient.openRouterZDRBody : [:]
+        )
+    case .gemini:
+        return OpenAIClient(apiKey: settings.llm.geminiAPIKey, baseURL: OpenAICompatiblePreset.gemini.baseURL)
+    case .groq:
+        return OpenAIClient(apiKey: settings.llm.groqAPIKey, baseURL: OpenAICompatiblePreset.groq.baseURL)
+    case .openAICompatible:
+        guard let base = URL(string: settings.llm.customBaseURL), base.host != nil else { return nil }
+        // Self-hosted servers often need no key; OpenAIClient requires one.
+        let key = settings.llm.customAPIKey.isEmpty ? "none" : settings.llm.customAPIKey
+        return OpenAIClient(apiKey: key, baseURL: base, timeoutInterval: 600, skipModelFilter: true)
+    case .codexCLI:
+        return CLIChatClient(vendor: .codex)
+    case .grokCLI:
+        return CLIChatClient(vendor: .grok)
     }
 }
 
+/// Returns the client for the task's provider. Never returns a different
+/// provider than the one configured: if it can't be built (MLX without a
+/// ModelManager) or the cloud gate blocks it, the returned client throws a
+/// clear error instead of silently talking to something else.
+///
+/// When the task's sub-steps resolve elsewhere (Hybrid's "Action items" on
+/// this Mac while "Meeting notes" go to the cloud, or an Advanced override),
+/// or Hybrid needs a local fallback for a cloud task, the client is a
+/// `TaskRoutedClient` that sends each request to its own route.
 @MainActor
 func makeLLMClient(settings: AppSettings, modelManager: ModelManager? = nil, taskType: LLMTaskType? = nil) -> any LLMClient {
-    let provider: AppSettings.LLMProvider
-    if let taskType, let override = settings.routeConfig(for: taskType) {
-        provider = override.provider
-    } else {
-        provider = settings.llmProvider
+    let route = resolveRoute(settings: settings, taskType: taskType)
+    let provider = route.provider
+    guard let client = makeGatedClient(for: provider, settings: settings, modelManager: modelManager) else {
+        return UnavailableLLMClient(.setupRequired(
+            "\(provider.displayName) isn't ready. Finish AI setup in Settings → AI."
+        ))
+    }
+    guard let taskType else { return client }
+
+    var subRoutes: [LLMTaskType: RoutedTarget] = [:]
+    for sub in classifiableSubTasks where sub != taskType {
+        let subRoute = resolveRoute(settings: settings, taskType: sub)
+        if subRoute.provider != provider || (!subRoute.model.isEmpty && subRoute.model != route.model) {
+            subRoutes[sub] = routedTarget(for: subRoute, task: sub, settings: settings, modelManager: modelManager)
+        }
+    }
+    let isCloud = provider.locality(settings: settings) == .cloud
+    let wantsFallback = runMode(settings: settings) == .hybrid
+        && (isCloud || subRoutes.values.contains(where: \.isCloud))
+    guard !subRoutes.isEmpty || wantsFallback else { return client }
+
+    let primary = RoutedTarget(
+        task: taskType,
+        providerName: provider.displayName,
+        client: client,
+        model: effectiveModel(for: taskType == .summarization ? .summary : .query, settings: settings, taskType: taskType),
+        isCloud: isCloud
+    )
+    return TaskRoutedClient(
+        declaredTask: taskType,
+        primary: primary,
+        subRoutes: subRoutes,
+        localFallback: wantsFallback ? hybridLocalTarget(task: taskType, settings: settings, modelManager: modelManager) : nil,
+        onFallback: { notice in
+            Task { @MainActor in AIFallbackLog.shared.record(notice) }
+        }
+    )
+}
+
+/// A client for a specific provider that meeting data may be sent to.
+///
+/// Use this, not `makeClientForProvider`, whenever the request carries meeting
+/// content ("Regenerate with…", "Retry with…", fallbacks). When the privacy
+/// rules block the provider (Local-only mode, cloud AI off) it returns a client
+/// that throws `LLMError.cloudBlocked` without sending anything. Returns nil
+/// only when the provider can't be built (not configured).
+@MainActor
+func makeGatedClient(
+    for provider: AppSettings.LLMProvider,
+    purpose: LLMCloudPurpose = .primary,
+    settings: AppSettings,
+    modelManager: ModelManager? = nil
+) -> (any LLMClient)? {
+    if let blocked = providerBlockedError(provider, for: purpose, settings: settings) {
+        return UnavailableLLMClient(blocked)
     }
     return makeClientForProvider(provider, settings: settings, modelManager: modelManager)
-        ?? OllamaClient() // fallback if MLX without modelManager
 }
 
 let fallbackLogger = Logger(subsystem: "io.lidia.app", category: "ProviderFallback")
 
 /// Runs an LLM operation with automatic fallback to a secondary provider on failure.
+///
+/// A fallback that would move data from a local provider to a cloud provider
+/// only runs when `allowsCloud(for: .fallback, …)` says so (the user chose
+/// "Always"). Otherwise it throws `LLMError.cloudBlocked` (policy "Ask") or the
+/// original error (policy "Never"); it never crosses silently.
 @MainActor
 func withProviderFallback<T: Sendable>(
     settings: AppSettings,
@@ -604,21 +698,24 @@ func withProviderFallback<T: Sendable>(
             try await operation(primaryClient, primaryModel)
         }
     } catch {
-        guard let fallbackProviderEnum = AppSettings.LLMProvider(rawValue: settings.fallbackProvider) else {
+        guard let fallbackProviderEnum = AppSettings.LLMProvider(storedValue: settings.fallbackProvider) else {
             throw error
         }
 
-        let currentProvider: AppSettings.LLMProvider
-        if let taskType, let override = settings.routeConfig(for: taskType) {
-            currentProvider = override.provider
-        } else {
-            currentProvider = settings.llmProvider
-        }
+        let currentProvider = resolvedProvider(settings: settings, taskType: taskType)
         guard fallbackProviderEnum != currentProvider else {
             throw error
         }
 
-        guard let client = makeClientForProvider(fallbackProviderEnum, settings: settings, modelManager: modelManager) else {
+        switch fallbackDecision(from: currentProvider, to: fallbackProviderEnum, settings: settings) {
+        case .allow:
+            break
+        case .block(let blockError):
+            fallbackLogger.info("Fallback from \(currentProvider.rawValue, privacy: .public) to \(fallbackProviderEnum.rawValue, privacy: .public) blocked by cloud policy")
+            throw blockError ?? error
+        }
+
+        guard let client = makeGatedClient(for: fallbackProviderEnum, settings: settings, modelManager: modelManager) else {
             throw error
         }
 
@@ -626,7 +723,7 @@ func withProviderFallback<T: Sendable>(
             ? defaultModelForProvider(fallbackProviderEnum, settings: settings)
             : settings.fallbackModel
 
-        fallbackLogger.info("Primary provider \(currentProvider.rawValue) failed, falling back to \(fallbackProviderEnum.rawValue)")
+        fallbackLogger.info("Primary provider \(currentProvider.rawValue, privacy: .public) failed, falling back to \(fallbackProviderEnum.rawValue, privacy: .public)")
 
         return try await withRetry {
             try await operation(client, model)
@@ -636,11 +733,17 @@ func withProviderFallback<T: Sendable>(
 
 @MainActor
 func effectiveModel(for purpose: ModelPurpose, settings: AppSettings, taskType: LLMTaskType? = nil) -> String {
-    if let taskType, let override = settings.routeConfig(for: taskType) {
-        if !override.model.isEmpty {
-            return override.model
+    let route = resolveRoute(settings: settings, taskType: taskType)
+    switch route.source {
+    case .override, .inheritedOverride, .hybridCloud:
+        return route.model.isEmpty ? defaultModelForProvider(route.provider, settings: settings) : route.model
+    case .hybridLocal, .localOnlyForced:
+        // The per-purpose models belong to the main provider.
+        guard route.provider == settings.llmProvider else {
+            return defaultModelForProvider(route.provider, settings: settings)
         }
-        return defaultModelForProvider(override.provider, settings: settings)
+    case .base:
+        break
     }
 
     switch purpose {
@@ -656,50 +759,62 @@ func effectiveModel(for purpose: ModelPurpose, settings: AppSettings, taskType: 
 @MainActor
 func defaultModelForProvider(_ provider: AppSettings.LLMProvider, settings: AppSettings) -> String {
     switch provider {
+    case .automaticLocal:
+        // The client resolves the real local model per request (only the
+        // verified recommended one), so never echo a stale MLX pick here: it
+        // was shown as the answering model even when it wasn't used.
+        return AutomaticLocalClient.modelID
+    case .appleOnDevice: return AppleFoundationClient.modelID
     case .ollama: return settings.ollamaModel.isEmpty ? "qwen3:4b" : settings.ollamaModel
     case .lmStudio: return settings.lmStudioModel
     case .mlx: return settings.selectedMLXModelID
-    case .openai: return settings.openaiModel.isEmpty ? "gpt-4o" : settings.openaiModel
-    case .anthropic: return settings.anthropicModel.isEmpty ? "claude-sonnet-4-5-20250514" : settings.anthropicModel
-    case .cerebras: return settings.cerebrasModel.isEmpty ? "llama-3.3-70b" : settings.cerebrasModel
-    case .deepseek: return settings.deepseekModel.isEmpty ? "deepseek-chat" : settings.deepseekModel
-    case .nvidiaNIM: return settings.nvidiaModel.isEmpty ? "moonshotai/kimi-k2.5" : settings.nvidiaModel
-    case .openRouter: return settings.openRouterModel.isEmpty ? "google/gemini-2.0-flash-001" : settings.openRouterModel
+    case .openai, .cerebras, .deepseek, .nvidiaNIM, .openRouter, .gemini, .groq, .openAICompatible:
+        // The user's choice, else the best match in the fetched model list
+        // by family preference (no stale hard-coded IDs).
+        let chosen = storedModel(for: provider, settings: settings)
+        if !chosen.isEmpty { return chosen }
+        let fetched = provider == settings.llmProvider ? settings.availableModels : []
+        return ModelMenuCatalog.autoModel(for: provider, availableModels: fetched)
+    case .anthropic:
+        if !settings.anthropicModel.isEmpty { return settings.anthropicModel }
+        let fetched = provider == settings.llmProvider ? settings.availableModels : []
+        let auto = ModelMenuCatalog.autoModel(for: .anthropic, availableModels: fetched)
+        return auto.isEmpty ? LLMSettings.defaultAnthropicModel : auto
+    case .codexCLI, .grokCLI:
+        let chosen = storedModel(for: provider, settings: settings)
+        return chosen.isEmpty ? CLIVendor.defaultModelID : chosen
+    }
+}
+
+/// The model saved in settings for a provider ("" when none).
+@MainActor
+func storedModel(for provider: AppSettings.LLMProvider, settings: AppSettings) -> String {
+    switch provider {
+    case .automaticLocal, .mlx: return settings.selectedMLXModelID
+    case .appleOnDevice: return AppleFoundationClient.modelID
+    case .ollama: return settings.ollamaModel
+    case .lmStudio: return settings.lmStudioModel
+    case .openai: return settings.openaiModel
+    case .anthropic: return settings.anthropicModel
+    case .cerebras: return settings.cerebrasModel
+    case .deepseek: return settings.deepseekModel
+    case .nvidiaNIM: return settings.nvidiaModel
+    case .openRouter: return settings.openRouterModel
+    case .gemini: return settings.llm.geminiModel
+    case .groq: return settings.llm.groqModel
+    case .openAICompatible: return settings.llm.customModel
+    case .codexCLI: return settings.llm.codexModel
+    case .grokCLI: return settings.llm.grokModel
     }
 }
 
 @MainActor
 private func effectiveDefaultModel(settings: AppSettings) -> String {
-    let selectedModel: String
-    switch settings.llmProvider {
-    case .ollama:
-        selectedModel = settings.ollamaModel
-    case .lmStudio:
-        selectedModel = settings.lmStudioModel
-    case .mlx:
-        selectedModel = settings.selectedMLXModelID
-    case .openai:
-        selectedModel = settings.openaiModel
-    case .anthropic:
-        selectedModel = settings.anthropicModel
-    case .cerebras:
-        selectedModel = settings.cerebrasModel
-    case .deepseek:
-        selectedModel = settings.deepseekModel
-    case .nvidiaNIM:
-        selectedModel = settings.nvidiaModel
-    case .openRouter:
-        selectedModel = settings.openRouterModel
-    }
-
+    let selectedModel = storedModel(for: settings.llmProvider, settings: settings)
     if !selectedModel.isEmpty {
         return selectedModel
     }
-
-    return ModelMenuCatalog.autoModel(
-        for: settings.llmProvider,
-        availableModels: settings.availableModels
-    )
+    return defaultModelForProvider(settings.llmProvider, settings: settings)
 }
 
 enum ModelPurpose {
@@ -708,11 +823,23 @@ enum ModelPurpose {
     case general
 }
 
+/// A kind of AI request, for per-task routing (Settings → AI → Advanced) and
+/// the Hybrid list. Raw values are stored in route overrides: never change them.
+/// `displayName`, defaults and order live in HybridRouting.swift.
 enum LLMTaskType: String, CaseIterable, Codable, Sendable {
     case transcriptRefinement = "Transcript Refinement"
     case summarization = "Summarization"
+    /// Short requests from dictation, Intelligence, voice, recipes and manual prep.
     case chat = "Chat"
     case templateDetection = "Template Detection"
+    /// The structured facts step (title, decisions, action items) and action routing.
+    case actionItems = "Action Items"
+    /// Proactive prep briefs.
+    case prepBrief = "Prep Briefs"
+    /// Ask (⌘K) and chat bar answers.
+    case ask = "Ask"
+    /// Post-meeting follow-up drafts.
+    case followUp = "Follow-up Drafts"
 }
 
 struct LLMRouteConfig: Codable, Sendable, Equatable {

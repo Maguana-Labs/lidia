@@ -66,7 +66,10 @@ final class VoiceSettings {
         isLoading = true
         defer { isLoading = false }
         let defaults = UserDefaults.standard
-        sttEngine = AppSettings.STTEngineType(rawValue: defaults.string(forKey: "sttEngine") ?? "") ?? .parakeet
+        // Until the user picks an engine, choose one that handles their language
+        // (not saved, so it follows later language changes).
+        sttEngine = AppSettings.STTEngineType(rawValue: defaults.string(forKey: "sttEngine") ?? "")
+            ?? STTEngineDefaults.recommendedEngine(sttLanguage: defaults.string(forKey: "sttLanguage") ?? "")
         whisperKitModel = defaults.string(forKey: "whisperKitModel") ?? ""
         if let diar = defaults.object(forKey: "enableDiarization") as? Bool {
             enableDiarization = diar

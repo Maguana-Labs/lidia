@@ -4,84 +4,111 @@
 
 # LidIA
 
-A native macOS meeting intelligence app — transcribe, summarize, and chat with your meetings using local or cloud AI.
+LidIA records your meetings, writes the notes, and keeps track of what you
+promised. It's a native Mac app, with an iPhone companion, and it does all of
+it on your Mac by default.
 
-**Local-first by default.** LidIA runs entirely on your Mac with no data leaving your device. Optionally connect cloud providers (OpenAI, Anthropic) for faster or more capable models.
+*Named for Lidia Mariana, who loved red.* Red is LidIA's colour because it was hers.
 
-## Features
+## What it does
 
-### Core
-- **Real-time transcription** — Apple Speech, WhisperKit, or NVIDIA Parakeet (all on-device)
-- **AI-powered summaries** — Automatic title, multi-section summary, decisions, and action items
-- **Meeting templates** — General, 1:1, Brainstorm, Standup — or create your own
-- **Chat with any meeting** — Ask questions about transcripts and summaries with conversational AI
-- **Action item tracking** — Extracted automatically, tracked across meetings
-- **Global search** — Cmd+K to search across all meetings
+- **Records** any call or in-person meeting. Audio is written to disk as it's
+  captured, so a crash or a full battery doesn't lose the meeting.
+- **Transcribes on your Mac**: Apple Speech, NVIDIA Parakeet or WhisperKit, live
+  while you talk and refined after, with your mic and the other side kept apart.
+- **Writes the notes**: topics, decisions and next steps, merged with what you
+  typed during the meeting, and streamed as they're written.
+- **Tracks action items** with owner and deadline, on a list or a board, and
+  proposes the next step: a reminder, a ClickUp or Notion task, an n8n flow, a
+  follow-up email for you to review.
+- **Answers questions** about all your meetings (⌘K), with the meetings it used
+  as sources.
+- **Prepares you** for the next meeting: what you talked about last time and
+  what is still open.
+- **Fits into your Mac**: the menu bar shows the next meeting and a live
+  recording timer; Apple and Google Calendar; dictation in any app with your
+  own vocabulary; a voice assistant; Siri and Shortcuts; and a local MCP server
+  so other AI apps can read your meetings.
+- **iPhone and Watch**: record on the iPhone with on-device transcription and
+  notes, a Live Activity while recording, and the library synced through your
+  own iCloud.
 
-### Voice Assistant
-- **Push-to-talk** — Hotkey-activated voice assistant with animated orb UI
-- **Meeting context** — Ask about your action items, upcoming meetings, past discussions
-- **Fully local option** — Parakeet STT + MLX LLM + System TTS (no API keys needed)
-- **Cloud option** — OpenAI for lower latency when preferred
+## Privacy
 
-### Integrations
-- **Google Calendar** — See upcoming events, one-click recording, auto-detect meetings
-- **Apple Calendar & Reminders** — Native EventKit integration
-- **Notion** — Push meeting notes to your Notion database
-- **n8n webhooks** — Trigger any automation (Slack, email, CRM) after meetings
+- Meetings, audio, transcripts and notes live on your Mac (and in your private
+  iCloud database if you turn on sync). There is no LidIA server and no
+  telemetry.
+- The default AI runs on your Mac: Apple Intelligence or a downloaded MLX
+  model. A local server (Ollama, LM Studio) works too.
+- A cloud model (Anthropic, OpenAI, OpenAI-compatible) is used only with your
+  own API key, only for the tasks you choose, and the app says what leaves the
+  Mac. **Local-only mode** blocks every network send of meeting content,
+  including AI and iCloud sync.
+- API keys are kept in the Keychain. Integrations are off until you turn them
+  on, and each one says exactly what it sends.
 
-### UX
-- **Floating transcript** — Live overlay showing words as they're captured
-- **Speaker separation** — Mic vs system audio diarization with chat bubble UI
-- **Menu bar** — Quick access from the macOS menu bar
-- **Keyboard shortcuts** — Cmd+1-5 for tabs, Cmd+R to record, Cmd+K to search
+## Build and run
 
-## Requirements
-
-- macOS 26 (Tahoe) or later
-- Xcode 26+ / Swift 6.2 (for building from source)
-- Apple Silicon recommended (for local MLX inference)
-
-## Build & Run
+Requirements: macOS 26 (Tahoe) or later on Apple Silicon, Xcode 26+ (Swift 6.2),
+and Xcode's Metal Toolchain for the MLX shaders:
 
 ```bash
-git clone https://github.com/lidia-app/LidIA.git
-cd LidIA
-./run.sh
+xcodebuild -downloadComponent MetalToolchain
 ```
 
-> **Important:** Always use `./run.sh` instead of `swift run`. The app needs a proper `.app` bundle for macOS TCC permissions (Microphone, Calendar, Reminders, Notifications) to work correctly.
+Then:
 
-Other commands:
 ```bash
-./run.sh build    # Build only (creates .build/LidIA.app)
-./run.sh clean    # Remove .app bundle
-swift build       # Compile check only (no .app bundle)
-swift test        # Run tests
+git clone https://github.com/Maguana-Labs/lidia.git
+cd lidia
+./run.sh             # build, package LidIA.app in .build/ and launch it
+./run.sh build       # build only
+swift build          # compile check
+swift test           # run the tests
 ```
 
-Or open `Package.swift` in Xcode 26+ and run from there.
+Use `./run.sh`, not `swift run`: macOS only grants microphone, calendar and
+notification access to a real `.app` bundle.
 
-## Setup
+The iPhone and Watch apps have their own Xcode projects. A fresh clone builds
+them unsigned:
 
-1. **Launch LidIA** — it works out of the box with local models (no API keys needed)
-2. **Download an MLX model** — Go to Settings (Cmd+,) → Models → Download a model (Qwen3 4B recommended, ~2.3 GB)
-3. **Grant permissions** when prompted — Microphone access is required for recording
-4. **Optional: Cloud providers** — Add API keys for OpenAI or Anthropic in Settings for cloud LLM/TTS
-5. **Optional: Integrations:**
-   - Google Calendar — Create OAuth credentials in [Google Cloud Console](https://console.cloud.google.com/), enter Client ID/Secret in Settings
-   - Notion — Create an [internal integration](https://www.notion.so/my-integrations), enter API key
-   - n8n — Enter your webhook URL for post-meeting automation
-   - Apple Calendar/Reminders — Grant access when prompted
+```bash
+xcodebuild build -project LidIAiOS/LidIAiOS.xcodeproj -scheme LidIAiOS \
+  -destination 'generic/platform=iOS' CODE_SIGNING_ALLOWED=NO
+xcodebuild build -project LidIAWatch/LidIAWatch.xcodeproj -scheme LidIAWatch \
+  -destination 'generic/platform=watchOS' CODE_SIGNING_ALLOWED=NO
+```
 
-## Usage
+## Signing
 
-1. Click **Record** (or click the record button on an upcoming calendar event) to start a meeting
-2. A floating transcript panel appears showing live transcription
-3. Click **Stop** to end — LidIA automatically refines the transcript, generates a summary, and extracts action items
-4. Use **Cmd+K** to search across all your meetings
-5. Click into any meeting to view Summary, Transcript, Notes, Action Items, or Chat
-6. Press your voice hotkey (default: Option+Space) to talk to the voice assistant
+Nothing in the repo names a developer team or certificate.
+
+- **Mac app:** `run.sh` signs with the first "Apple Development" identity in your
+  keychain (or `LIDIA_SIGN_IDENTITY`), and falls back to ad-hoc signing if there
+  is none. iCloud sync needs an Apple Development identity; see
+  [docs/icloud-sync.md](docs/icloud-sync.md).
+- **iPhone, Watch and the iCloud provisioning helper:** copy
+  `Config/Local.xcconfig.example` to `Config/Local.xcconfig` and set your
+  `DEVELOPMENT_TEAM`. That file is gitignored; `Config/Signing.xcconfig`
+  includes it when it's there.
+- **Releases:** `scripts/create-release.sh` uses the "Developer ID Application"
+  certificate in your keychain; see [docs/release-signing.md](docs/release-signing.md).
+
+## First run
+
+1. Launch LidIA. It works without any API key.
+2. Grant microphone access when asked (and calendar access, for the agenda).
+3. Pick where AI runs in Settings: Apple Intelligence, a downloaded model
+   (Settings › Models), a local server, or a cloud provider with your key.
+4. Optional: connect Google Calendar, Notion, n8n, Slack or ClickUp in Settings.
+
+## Contributing
+
+Read [CONTRIBUTING.md](CONTRIBUTING.md) and [CLAUDE.md](CLAUDE.md) (project
+structure and conventions). Tests and examples use the made-up people and
+companies in [docs/fictional-cast.md](docs/fictional-cast.md); please don't
+add real names, meetings or transcripts.
 
 ## Architecture
 
@@ -99,8 +126,9 @@ See [CLAUDE.md](CLAUDE.md) for detailed project structure and development guide.
 
 | Provider | Type | Best For |
 |----------|------|----------|
+| **Apple Intelligence** | Local (on-device) | Built in, nothing to download |
 | **MLX** | Local (on-device) | Privacy, offline use, free |
-| **Ollama** | Local (server) | Larger models, GPU offload |
+| **Ollama, LM Studio** | Local (server) | Larger models, GPU offload |
 | **OpenAI** | Cloud | Highest quality, fastest |
 | **Anthropic** | Cloud | Claude models |
 
@@ -112,39 +140,14 @@ See [CLAUDE.md](CLAUDE.md) for detailed project structure and development guide.
 | **WhisperKit** | Local | OpenAI Whisper on Apple Silicon |
 | **Apple Speech** | Local | Built-in, no download needed |
 
-## Contributing
-
-Contributions are welcome! Here's how to get started:
-
-1. Fork the repository
-2. Create a feature branch (`git checkout -b feature/my-feature`)
-3. Make your changes and ensure `swift build` passes
-4. Commit with clear messages
-5. Push to your fork and open a Pull Request
-
-### Development Tips
-
-- Read [CLAUDE.md](CLAUDE.md) for project structure, conventions, and common tasks
-- Use `swift build` for quick compile checks, `./run.sh` for full app testing
-- Follow existing patterns — `@Observable` for state, actors for network clients
-- macOS 26+ APIs are fine — this project targets Tahoe only
-- Swift 6.2 strict concurrency — all `Sendable` requirements must be satisfied
-
-### Areas We'd Love Help With
-
-- Multi-language transcription support
-- Additional integrations (Slack, Linear, Jira)
-- UI/UX improvements
-- Documentation and tutorials
-- Testing coverage
-
 ## Dependencies
 
 See [DEPENDENCIES.md](DEPENDENCIES.md) for a full list of dependencies and their licenses.
 
 ## Why "LidIA"?
 
-LidIA is named after Lidia, the creator's mother, as a tribute to her while she fights cancer. The name also nods to the AI at its core — Lid**IA**. Built with love. ❤️
+LidIA is named after Lidia Mariana, the creator's mother, who loved red; her
+colour is the app's colour. The name also nods to the AI at its core: Lid**IA**.
 
 ## License
 

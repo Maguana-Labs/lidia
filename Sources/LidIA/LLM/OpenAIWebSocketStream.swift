@@ -36,6 +36,19 @@ final class OpenAIWebSocketStream: ChatStream {
                     return
                 }
 
+                // Send-time privacy backstop: never open or use the socket in
+                // Local-only mode, even if this stream was built earlier.
+                guard PrivacyGate.allowsAIEndpoint(Self.endpoint) else {
+                    self.reset()
+                    let error = LLMError.cloudBlocked(
+                        provider: "OpenAI",
+                        reason: "Local-only mode is on, so meeting data stays on this Mac."
+                    )
+                    continuation.yield("[Error: \(error.localizedDescription)]")
+                    continuation.finish()
+                    return
+                }
+
                 if self.webSocketTask == nil {
                     self.connect()
                 }
@@ -85,9 +98,10 @@ final class OpenAIWebSocketStream: ChatStream {
 
     // MARK: - Private: Connection
 
+    static let endpoint = URL(string: "wss://api.openai.com/v1/responses")!
+
     private func connect() {
-        let url = URL(string: "wss://api.openai.com/v1/responses")!
-        var request = URLRequest(url: url)
+        var request = URLRequest(url: Self.endpoint)
         request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
         request.setValue("realtime=v1", forHTTPHeaderField: "OpenAI-Beta")
 
@@ -130,27 +144,12 @@ final class OpenAIWebSocketStream: ChatStream {
             // First message: include full context
             var inputItems: [[String: Any]] = []
 
-            // System message with meeting context
-            if !context.isEmpty {
-                let dateString = ISO8601DateFormatter.string(from: Date(), timeZone: .current, formatOptions: [.withFullDate])
-                let systemPrompt = """
-                You are LidIA, an intelligent meeting assistant. Today is \(dateString).
-
-                Use the following meeting context to answer the user's question:
-
-                \(context)
-
-                Grounding rules:
-                - Base answers only on the provided meeting context.
-                - If the context is insufficient, start your response with "Insufficient evidence:".
-                - Prefer concise answers that reference specific meeting titles when possible.
-                """
-                inputItems.append([
-                    "type": "message",
-                    "role": "system",
-                    "content": [["type": "input_text", "text": systemPrompt]],
-                ])
-            }
+            // System message: always sent, so the model can chat even when no meeting matched.
+            inputItems.append([
+                "type": "message",
+                "role": "system",
+                "content": [["type": "input_text", "text": LidIAChatPrompt.system(context: context)]],
+            ])
 
             // History messages
             for msg in history {

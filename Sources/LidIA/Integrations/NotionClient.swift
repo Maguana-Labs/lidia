@@ -59,6 +59,7 @@ actor NotionClient {
         duration: TimeInterval,
         bodyMarkdown: String
     ) async throws -> String {
+        try PrivacyGate.check(.notion)
         let url = baseURL.appendingPathComponent("pages")
         let payload = Self.createPagePayload(
             databaseID: databaseID,
@@ -106,6 +107,7 @@ actor NotionClient {
         isCompleted: Bool,
         meetingTitle: String
     ) async throws -> String {
+        try PrivacyGate.check(.notion)
         if let existingPageID, !existingPageID.isEmpty {
             let url = baseURL.appendingPathComponent("pages").appendingPathComponent(existingPageID)
             let payload = Self.updateTaskPagePayload(

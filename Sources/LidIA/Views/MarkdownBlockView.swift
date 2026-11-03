@@ -4,6 +4,8 @@ import SwiftUI
 /// headings, bullet lists (with nesting), and paragraphs.
 struct MarkdownBlockView: View {
     let text: String
+    /// Style for paragraphs and bullets. AI-written content passes `.secondary`.
+    var textStyle: HierarchicalShapeStyle = .primary
 
     var body: some View {
         VStack(alignment: .leading, spacing: 4) {
@@ -19,6 +21,7 @@ struct MarkdownBlockView: View {
         case heading(level: Int, text: String)
         case bullet(indent: Int, text: String)
         case paragraph(String)
+        case rule
         case blank
     }
 
@@ -33,6 +36,12 @@ struct MarkdownBlockView: View {
 
             if trimmed.isEmpty {
                 blocks.append(.blank)
+                continue
+            }
+
+            // Horizontal rules: ---, ***, ___
+            if trimmed.count >= 3, Set(trimmed).count == 1, "-*_".contains(trimmed.first!) {
+                blocks.append(.rule)
                 continue
             }
 
@@ -68,13 +77,17 @@ struct MarkdownBlockView: View {
         switch block {
         case .heading(let level, let text):
             headingView(level: level, text: text)
-                .padding(.top, level <= 2 ? 12 : 8)
-                .padding(.bottom, 2)
+                .padding(.top, level <= 2 ? 14 : 8)
+                .padding(.bottom, 1)
+                .accessibilityAddTraits(.isHeader)
         case .bullet(let indent, let text):
             bulletView(indent: indent, text: text)
         case .paragraph(let text):
             inlineMarkdown(text)
                 .font(.body)
+                .foregroundStyle(textStyle)
+        case .rule:
+            Divider().padding(.vertical, 8)
         case .blank:
             Spacer().frame(height: 4)
         }
@@ -88,10 +101,10 @@ struct MarkdownBlockView: View {
 
     private func headingFont(_ level: Int) -> Font {
         switch level {
-        case 1: .title2.bold()
-        case 2: .title3.bold()
-        case 3: .headline
-        default: .subheadline.bold()
+        case 1: .title3.weight(.semibold)
+        case 2: .headline
+        case 3: .body.weight(.semibold)
+        default: .subheadline.weight(.semibold)
         }
     }
 
@@ -99,11 +112,15 @@ struct MarkdownBlockView: View {
         HStack(alignment: .firstTextBaseline, spacing: 6) {
             Text(indent == 0 ? "\u{2022}" : "\u{25E6}")
                 .font(.body)
-                .foregroundStyle(.secondary)
+                .foregroundStyle(.tertiary)
+                .frame(width: 10, alignment: .leading)
             inlineMarkdown(text)
                 .font(.body)
+                .foregroundStyle(textStyle)
+                .lineSpacing(2)
+                .frame(maxWidth: .infinity, alignment: .leading)
         }
-        .padding(.leading, CGFloat(indent) * 16)
+        .padding(.leading, CGFloat(indent) * 18)
     }
 
     private func inlineMarkdown(_ text: String) -> Text {

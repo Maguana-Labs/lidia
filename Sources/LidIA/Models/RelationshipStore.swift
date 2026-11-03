@@ -36,7 +36,7 @@ final class RelationshipStore {
             .joined(separator: " ")
     }
 
-    func buildProfiles(modelContext: ModelContext) -> [PersonProfile] {
+    func buildProfiles(modelContext: ModelContext, currentUserName: String = MeetingAttendeeContext.currentUserName) -> [PersonProfile] {
         let meetingDescriptor = FetchDescriptor<Meeting>(
             sortBy: [SortDescriptor(\.date, order: .reverse)]
         )
@@ -60,29 +60,40 @@ final class RelationshipStore {
         var people: [String: PersonData] = [:]
 
         for meeting in completedMeetings {
-            guard let attendees = meeting.calendarAttendees else { continue }
-            for attendee in attendees {
-                let trimmed = attendee.trimmingCharacters(in: .whitespacesAndNewlines)
-                guard !trimmed.isEmpty else { continue }
-
-                let parsed = Self.parseAttendee(trimmed)
-                let key: String
-                if let email = parsed.email {
-                    key = email
-                } else if let name = parsed.displayName {
-                    key = name.lowercased()
-                } else {
-                    continue
-                }
+            // Parsed people (one raw entry can hold several), without the user.
+            let attendees = AttendeeParser.parse(meeting.calendarAttendees ?? [], currentUserName: currentUserName)
+            for attendee in attendees where !attendee.isCurrentUser {
+                let key = attendee.email ?? attendee.name.lowercased()
+                guard !key.isEmpty else { continue }
 
                 var data = people[key] ?? PersonData()
-                if let email = parsed.email { data.email = email }
-                if let name = parsed.displayName, !name.isEmpty {
-                    data.displayName = name
+                if let email = attendee.email { data.email = email }
+                if !attendee.name.isEmpty, data.displayName == nil || attendee.name.count > (data.displayName?.count ?? 0) {
+                    data.displayName = attendee.name
                 }
                 data.meetings.append(meeting)
                 people[key] = data
             }
+        }
+
+        // "Leo" with no email in one meeting is leo@… from another.
+        for key in people.keys where !key.contains("@") {
+            guard let nameOnly = people[key] else { continue }
+            let folded = AttendeeParser.fold(nameOnly.displayName ?? key)
+            let candidates = people.filter { candidate in
+                guard candidate.key.contains("@"), let name = candidate.value.displayName else { return false }
+                let other = AttendeeParser.fold(name)
+                let firstOf = { (text: String) in text.split(separator: " ").first.map(String.init) }
+                return other == folded
+                    || (!folded.contains(" ") && firstOf(other) == folded)
+                    || (!other.contains(" ") && firstOf(folded) == other)
+            }
+            guard candidates.count == 1, let target = candidates.first else { continue }
+            people[target.key]?.meetings += nameOnly.meetings
+            if let fuller = nameOnly.displayName, fuller.count > (people[target.key]?.displayName?.count ?? 0) {
+                people[target.key]?.displayName = fuller
+            }
+            people[key] = nil
         }
 
         let talkingPointsByPerson = Dictionary(grouping: talkingPoints.filter { !$0.isUsed }) {
@@ -124,49 +135,46 @@ final class RelationshipStore {
         .sorted { $0.lastMet > $1.lastMet }
     }
 
-    func companies(from meetings: [Meeting]) -> [Company] {
+    /// Companies from attendee emails (personal mail domains skipped), one per
+    /// company name so harborcloud.example and harborcloud.test are one company. Each
+    /// meeting counts once per company.
+    func companies(from meetings: [Meeting], currentUserName: String = MeetingAttendeeContext.currentUserName) -> [Company] {
         var companyMap: [String: Company] = [:]
+        var domainToName: [String: String] = [:]
 
-        for meeting in meetings where meeting.status == .complete {
-            for attendee in meeting.calendarAttendees ?? [] {
-                let parsed = Self.parseAttendee(attendee)
-                guard let email = parsed.email else { continue }
-                guard let domain = email.split(separator: "@").last.map(String.init) else { continue }
-
-                // Skip personal email domains
-                let personalDomains: Set<String> = [
-                    "gmail.com", "yahoo.com", "hotmail.com", "outlook.com",
-                    "icloud.com", "me.com", "live.com", "aol.com", "protonmail.com"
-                ]
-                guard !personalDomains.contains(domain) else { continue }
-
-                var company = companyMap[domain] ?? Company(
-                    domain: domain,
-                    name: Company.displayName(from: domain)
-                )
-                company.attendeeEmails.insert(email)
-                company.meetingCount += 1
-                if let date = company.lastMeetingDate {
-                    if meeting.date > date { company.lastMeetingDate = meeting.date }
-                } else {
-                    company.lastMeetingDate = meeting.date
+        for meeting in meetings where meeting.status == .complete && !meeting.isDeleted {
+            let attendees = AttendeeParser.parse(meeting.calendarAttendees ?? [], currentUserName: currentUserName)
+            var countedThisMeeting: Set<String> = []
+            for attendee in attendees {
+                guard let email = attendee.email, let domain = attendee.domain,
+                      let name = AttendeeParser.companyName(forEmail: email) else { continue }
+                domainToName[domain] = name
+                var company = companyMap[name] ?? Company(domain: domain, name: name)
+                if !attendee.isCurrentUser { company.attendeeEmails.insert(email) }
+                if countedThisMeeting.insert(name).inserted {
+                    company.meetingCount += 1
+                    if company.lastMeetingDate.map({ meeting.date > $0 }) ?? true {
+                        company.lastMeetingDate = meeting.date
+                    }
                 }
-                companyMap[domain] = company
+                companyMap[name] = company
             }
         }
 
         // Count open action items per company
-        for meeting in meetings {
-            for item in meeting.actionItems where !item.isCompleted {
+        for meeting in meetings where !meeting.isDeleted {
+            for item in meeting.actionItems where !item.isDeleted && !item.isCompleted {
                 if let assignee = item.assignee?.lowercased(),
                    let domain = assignee.split(separator: "@").last.map(String.init),
-                   companyMap[domain] != nil {
-                    companyMap[domain]?.openActionItems += 1
+                   let name = domainToName[domain] {
+                    companyMap[name]?.openActionItems += 1
                 }
             }
         }
 
-        return companyMap.values.sorted { $0.meetingCount > $1.meetingCount }
+        return companyMap.values
+            .filter { !$0.attendeeEmails.isEmpty }
+            .sorted { $0.meetingCount != $1.meetingCount ? $0.meetingCount > $1.meetingCount : $0.name < $1.name }
     }
 
     func prepContext(for attendees: [String], modelContext: ModelContext) -> String {

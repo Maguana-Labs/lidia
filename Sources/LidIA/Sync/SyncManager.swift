@@ -1,4 +1,5 @@
 import Foundation
+import LidIAKit
 import SwiftData
 import os
 
@@ -24,12 +25,40 @@ final class SyncManager {
 
     private var didInitialPush = false
 
+    /// Why sync is not running, for the settings UI. `nil` when running or off.
+    private(set) var configurationProblem: String?
+
     func configure(settings: AppSettings, modelContext: ModelContext) {
         self.modelContext = modelContext
+        configurationProblem = nil
+
+        // The MCP inbox is local-only and independent of device sync, but this
+        // is the one place the app hands us its background context at launch.
+        MCPInboxImporter.shared.start(modelContext: modelContext)
 
         guard settings.syncEnabled,
               !settings.syncServerURL.isEmpty,
               !settings.syncAuthToken.isEmpty else {
+            stop()
+            return
+        }
+
+        guard !settings.localOnlyMode else {
+            configurationProblem = "Paused: Local-only mode is on."
+            stop()
+            return
+        }
+
+        // One sync at a time: both would bring the same meetings in and could duplicate them.
+        guard !CloudSyncRuntime.shared.mode.isICloud else {
+            configurationProblem = "Paused: iCloud sync is on. Turn it off in Settings › Sync to use your own server."
+            stop()
+            return
+        }
+
+        guard SyncSafety.isAllowedServerURL(settings.syncServerURL) else {
+            configurationProblem = "Use an https:// URL. Plain http:// is only allowed for this Mac or a private network address."
+            Self.logger.error("Sync not started: server URL is not https and not a private address")
             stop()
             return
         }
@@ -61,7 +90,7 @@ final class SyncManager {
 
     /// Push all existing meetings and action items to the server on first sync.
     private func pushAllExisting() async {
-        guard let client = syncClient, let context = modelContext else { return }
+        guard !PrivacyGate.isLocalOnly, let client = syncClient, let context = modelContext else { return }
 
         do {
             let meetings = try context.fetch(FetchDescriptor<Meeting>())
@@ -87,8 +116,8 @@ final class SyncManager {
             }
 
             // Push SOUL.md and MEMORY.md if they exist
-            let lidiaDir = NSHomeDirectory() + "/.lidia"
-            for filename in ["SOUL.md", "MEMORY.md"] {
+            let lidiaDir = LidIAFiles.lidiaDir
+            for filename in SyncSafety.syncedFileNames.sorted() {
                 let path = "\(lidiaDir)/\(filename)"
                 if let content = try? String(contentsOfFile: path, encoding: .utf8), !content.isEmpty {
                     await client.putJSON(path: "files/\(filename)", body: ["content": content])
@@ -102,7 +131,7 @@ final class SyncManager {
     }
 
     func pushMeeting(_ meeting: Meeting) {
-        guard isRunning, let client = syncClient else { return }
+        guard isRunning, !PrivacyGate.isLocalOnly, let client = syncClient else { return }
         let dto = SyncMeetingDTO(from: meeting)
         Task {
             let success = await client.postJSON(path: "meetings", body: dto)
@@ -113,7 +142,7 @@ final class SyncManager {
     }
 
     func pushActionItem(_ item: ActionItem) {
-        guard isRunning, let client = syncClient else { return }
+        guard isRunning, !PrivacyGate.isLocalOnly, let client = syncClient else { return }
         let dto = SyncActionItemDTO(from: item)
         Task {
             let success = await client.postJSON(path: "action-items", body: dto)
@@ -124,7 +153,8 @@ final class SyncManager {
     }
 
     func pushFile(name: String, content: String) {
-        guard isRunning, let client = syncClient else { return }
+        guard isRunning, !PrivacyGate.isLocalOnly, SyncSafety.isAllowedSyncedFileName(name),
+              let client = syncClient else { return }
         Task {
             await client.putJSON(path: "files/\(name)", body: ["content": content])
         }
@@ -140,16 +170,22 @@ final class SyncManager {
     // MARK: - Poll & Apply
 
     private func poll() async {
-        guard let client = syncClient, let context = modelContext else { return }
+        guard !PrivacyGate.isLocalOnly, let client = syncClient, let context = modelContext else { return }
 
         guard let response = await client.sync() else { return }
+        apply(response, in: context)
+    }
+
+    /// Applies a server response. Every server-supplied ID is parsed strictly,
+    /// file names are allowlisted and audio paths are never taken from the server.
+    func apply(_ response: SyncResponseDTO, in context: ModelContext) {
 
         // Apply meetings
         for syncMeeting in response.meetings {
             applyMeeting(syncMeeting, in: context)
         }
         for deletedID in response.deletedMeetingIDs {
-            if let uuid = UUID(uuidString: deletedID),
+            if let uuid = SyncSafety.identifier(deletedID),
                let meeting = fetchMeeting(id: uuid, in: context) {
                 context.delete(meeting)
             }
@@ -160,7 +196,7 @@ final class SyncManager {
             applyActionItem(syncItem, in: context)
         }
         for deletedID in response.deletedActionItemIDs {
-            if let uuid = UUID(uuidString: deletedID),
+            if let uuid = SyncSafety.identifier(deletedID),
                let item = fetchActionItem(id: uuid, in: context) {
                 context.delete(item)
             }
@@ -182,7 +218,10 @@ final class SyncManager {
     }
 
     private func applyMeeting(_ sync: SyncMeetingDTO, in context: ModelContext) {
-        guard let uuid = UUID(uuidString: sync.id) else { return }
+        guard let uuid = SyncSafety.identifier(sync.id) else {
+            Self.logger.warning("Ignored synced meeting with an invalid ID")
+            return
+        }
 
         if let meeting = fetchMeeting(id: uuid, in: context) {
             meeting.title = sync.title
@@ -193,12 +232,13 @@ final class SyncManager {
             meeting.status = MeetingStatus(rawValue: sync.status) ?? .complete
             meeting.notes = sync.notes
             meeting.folder = sync.folder
-            meeting.audioFilePath = sync.audioFilePath
+            // Audio paths are device-local; never take one from the server.
+            meeting.audioFilePath = SyncSafety.audioFilePath(local: meeting.audioFilePath, remote: sync.audioFilePath)
             meeting.userEditedTranscript = sync.userEditedTranscript
             meeting.userEditedSummary = sync.userEditedSummary
             meeting.calendarEventID = sync.calendarEventID
             meeting.calendarAttendees = decodeAttendees(sync.calendarAttendees)
-            meeting.templateID = sync.templateID.flatMap(UUID.init(uuidString:))
+            meeting.templateID = SyncSafety.identifier(sync.templateID)
         } else {
             let meeting = Meeting(
                 title: sync.title,
@@ -207,14 +247,16 @@ final class SyncManager {
                 refinedTranscript: sync.refinedTranscript,
                 summary: sync.summary,
                 status: MeetingStatus(rawValue: sync.status) ?? .complete,
-                audioFilePath: sync.audioFilePath,
+                audioFilePath: nil,
                 userEditedTranscript: sync.userEditedTranscript,
                 userEditedSummary: sync.userEditedSummary,
                 calendarEventID: sync.calendarEventID,
                 calendarAttendees: decodeAttendees(sync.calendarAttendees),
-                templateID: sync.templateID.flatMap(UUID.init(uuidString:)),
+                templateID: SyncSafety.identifier(sync.templateID),
                 notes: sync.notes,
-                folder: sync.folder
+                folder: sync.folder,
+                // Made on another device: this one must not recover or process it.
+                originDeviceID: nil
             )
             meeting.id = uuid
             context.insert(meeting)
@@ -222,7 +264,10 @@ final class SyncManager {
     }
 
     private func applyActionItem(_ sync: SyncActionItemDTO, in context: ModelContext) {
-        guard let uuid = UUID(uuidString: sync.id) else { return }
+        guard let uuid = SyncSafety.identifier(sync.id) else {
+            Self.logger.warning("Ignored synced action item with an invalid ID")
+            return
+        }
 
         if let item = fetchActionItem(id: uuid, in: context) {
             item.title = sync.title
@@ -230,7 +275,7 @@ final class SyncManager {
             item.deadline = sync.deadline
             item.deadlineDate = sync.deadlineDate.map { Date(timeIntervalSince1970: Double($0) / 1000) }
             item.isCompleted = sync.isCompleted != 0
-            if let meetingIDStr = sync.meetingID, let meetingUUID = UUID(uuidString: meetingIDStr) {
+            if let meetingUUID = SyncSafety.identifier(sync.meetingID) {
                 if item.meeting?.id != meetingUUID {
                     item.meeting = fetchMeeting(id: meetingUUID, in: context)
                 }
@@ -245,14 +290,23 @@ final class SyncManager {
             )
             item.id = uuid
             context.insert(item)
-            if let meetingIDStr = sync.meetingID, let meetingUUID = UUID(uuidString: meetingIDStr) {
+            if let meetingUUID = SyncSafety.identifier(sync.meetingID) {
                 item.meeting = fetchMeeting(id: meetingUUID, in: context)
             }
         }
     }
 
+    /// Directory synced files are written to. Overridable for tests.
+    var syncedFilesDirectory: String = LidIAFiles.lidiaDir
+
     private func applyFile(name: String, content: String) {
-        let dir = NSHomeDirectory() + "/.lidia"
+        // The name comes from the server: only the allowlisted names are written,
+        // which also rules out `../` and absolute paths.
+        guard SyncSafety.isAllowedSyncedFileName(name) else {
+            Self.logger.warning("Ignored synced file with unexpected name")
+            return
+        }
+        let dir = syncedFilesDirectory
         let path = "\(dir)/\(name)"
         let dirURL = URL(fileURLWithPath: dir)
 
@@ -359,7 +413,7 @@ private actor SyncHTTPClient {
 // MARK: - Sync DTOs
 
 /// Matches the lidia-sync Go API response format.
-private struct SyncResponseDTO: Codable, Sendable {
+struct SyncResponseDTO: Codable, Sendable {
     let serverTime: Int64
     let meetings: [SyncMeetingDTO]
     let actionItems: [SyncActionItemDTO]
@@ -379,7 +433,7 @@ private struct SyncResponseDTO: Codable, Sendable {
     }
 }
 
-private struct SyncMeetingDTO: Codable, Sendable {
+struct SyncMeetingDTO: Codable, Sendable {
     let id: String
     let title: String
     let date: Int64
@@ -434,7 +488,7 @@ private struct SyncMeetingDTO: Codable, Sendable {
     }
 }
 
-private struct SyncActionItemDTO: Codable, Sendable {
+struct SyncActionItemDTO: Codable, Sendable {
     let id: String
     let meetingID: String?
     let title: String

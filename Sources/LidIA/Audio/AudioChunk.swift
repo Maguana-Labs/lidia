@@ -27,6 +27,8 @@ struct AudioChunk: Sendable {
     static func computeRMS(_ samples: [Float]) -> Float {
         guard !samples.isEmpty else { return 0 }
         let sumOfSquares = samples.reduce(Float(0)) { $0 + $1 * $1 }
-        return sqrt(sumOfSquares / Float(samples.count))
+        let rms = sqrt(sumOfSquares / Float(samples.count))
+        // A malformed buffer (NaN or huge samples) must not reach the meters as NaN/inf.
+        return rms.isFinite ? rms : 0
     }
 }

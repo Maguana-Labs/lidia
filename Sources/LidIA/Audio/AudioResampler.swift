@@ -5,6 +5,9 @@ enum AudioResampler {
     /// Simple linear interpolation resampling from one sample rate to another.
     static func resample(_ samples: [Float], from sourceRate: Int, to targetRate: Int) -> [Float] {
         guard sourceRate != targetRate, !samples.isEmpty else { return samples }
+        // A 0 Hz rate (a device that reports no format) would make the ratio infinite
+        // and `Int(_:)` trap. There is no meaningful audio to return.
+        guard sourceRate > 0, targetRate > 0 else { return [] }
         let ratio = Double(targetRate) / Double(sourceRate)
         let outputCount = Int(Double(samples.count) * ratio)
         var output = [Float](repeating: 0, count: outputCount)

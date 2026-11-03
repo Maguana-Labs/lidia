@@ -17,6 +17,10 @@ final class AppSettings {
     let voice = VoiceSettings()
     let integration = IntegrationSettings()
     let recording = RecordingSettings()
+    /// Dictation everywhere (Sources/LidIA/Dictation).
+    let dictation = DictationSettings()
+    /// Cloud voices for the assistant (Sources/LidIA/Voice).
+    let voiceLayer = VoiceLayerSettings()
 
     // MARK: - General Settings (remain here)
 
@@ -36,9 +40,65 @@ final class AppSettings {
         didSet { saveFavoritePersonIDs() }
     }
 
+    // MARK: - Privacy & Consent
+
+    /// When on, nothing about a meeting leaves this Mac through an integration
+    /// (Notion, n8n, Slack, ClickUp, device sync, company logos). Google and
+    /// Apple Calendar reads still work. Enforced by `PrivacyGate`, which reads
+    /// the same `localOnlyMode` user default.
+    var localOnlyMode: Bool = false {
+        didSet { saveDefault(localOnlyMode, forKey: PrivacyGate.localOnlyModeKey) }
+    }
+
+    /// "Let Siri read meeting content": summaries, decisions, notes and Ask
+    /// answers may go to Siri (which can process requests on Apple's servers).
+    /// Titles, dates, people and action items always may. Local-only mode
+    /// overrides it. Read by `SiriContentPolicy` from the same user default.
+    var siriReadsMeetingContent: Bool = true {
+        didSet { saveDefault(siriReadsMeetingContent, forKey: "siriReadsMeetingContent") }
+    }
+
+    /// Show the "tell people you're taking AI notes" reminder when recording
+    /// starts. Turned off by the reminder's "Don't show again".
+    var consentReminderEnabled: Bool = true {
+        didSet { saveDefault(consentReminderEnabled, forKey: "consentReminderEnabled") }
+    }
+
+    /// For places where everyone on a call must agree to be recorded. When on,
+    /// the consent reminder always shows and "Don't show again" is hidden.
+    var allPartyConsentMode: Bool = false {
+        didSet { saveDefault(allPartyConsentMode, forKey: "allPartyConsentMode") }
+    }
+
+    /// Fetch company logos directly from each company's own website. Off by
+    /// default: when off, companies get a local monogram and no request is made.
+    var fetchCompanyLogos: Bool = false {
+        didSet { saveDefault(fetchCompanyLogos, forKey: "fetchCompanyLogos") }
+    }
+
+    // MARK: - Intelligence (on-device suggestions)
+
+    /// Put meetings in a project without asking when LidIA is all but certain
+    /// (see `ProjectSuggester.autoAssignThreshold`). Off by default.
+    var autoAssignProjects: Bool = false {
+        didSet { saveDefault(autoAssignProjects, forKey: "autoAssignProjects") }
+    }
+
+    /// Action item cards take a comment ("open a ticket in ClickUp") that AI
+    /// turns into an action for you to confirm. Each card can override it.
+    var commentToAIEnabled: Bool = true {
+        didSet { saveDefault(commentToAIEnabled, forKey: "commentToAIEnabled") }
+    }
+
     // Templates
     var meetingTemplates: [MeetingTemplate] = MeetingTemplate.builtInTemplates {
         didSet { saveTemplates() }
+    }
+
+    /// The template used when no past choice, rule or AI pick applies.
+    /// Empty means the built-in General template.
+    var defaultTemplateID: String = "" {
+        didSet { saveDefault(defaultTemplateID, forKey: "defaultTemplateID") }
     }
 
     // Template recurrence map: recurring event ID or attendee hash -> template ID
@@ -54,6 +114,10 @@ final class AppSettings {
     var llmProvider: LLMProvider {
         get { llm.llmProvider }
         set { llm.llmProvider = newValue }
+    }
+    var cloudFallbackPolicy: CloudFallbackPolicy {
+        get { llm.cloudFallbackPolicy }
+        set { llm.cloudFallbackPolicy = newValue }
     }
     var ollamaURL: String {
         get { llm.ollamaURL }
@@ -247,6 +311,10 @@ final class AppSettings {
         get { calendar.meetingNotificationMinutes }
         set { calendar.meetingNotificationMinutes = newValue }
     }
+    var hiddenCalendarIDs: [String] {
+        get { calendar.hiddenCalendarIDs }
+        set { calendar.hiddenCalendarIDs = newValue }
+    }
     var proactiveMorningDigest: Bool {
         get { calendar.proactiveMorningDigest }
         set { calendar.proactiveMorningDigest = newValue }
@@ -286,6 +354,10 @@ final class AppSettings {
     var proactiveQuietEnd: Date {
         get { calendar.proactiveQuietEnd }
         set { calendar.proactiveQuietEnd = newValue }
+    }
+    var noteTranscription: NoteTranscriptionMode {
+        get { recording.noteTranscription }
+        set { recording.noteTranscription = newValue }
     }
     var autoDetectMeetings: Bool {
         get { calendar.autoDetectMeetings }
@@ -413,6 +485,18 @@ final class AppSettings {
         get { integration.clickUpListID }
         set { integration.clickUpListID = newValue }
     }
+    var linearAPIKey: String {
+        get { integration.linearAPIKey }
+        set { integration.linearAPIKey = newValue }
+    }
+    var linearTeamID: String {
+        get { integration.linearTeamID }
+        set { integration.linearTeamID = newValue }
+    }
+    var linearTeamName: String {
+        get { integration.linearTeamName }
+        set { integration.linearTeamName = newValue }
+    }
     var autopilotEnabled: Bool {
         get { integration.autopilotEnabled }
         set { integration.autopilotEnabled = newValue }
@@ -476,16 +560,91 @@ final class AppSettings {
         }
     }
 
+    /// The AI provider. Raw values are persisted (UserDefaults `llmProvider`,
+    /// `fallbackProvider`, and the `routeOverrides` JSON), so existing raw
+    /// values must never change. Use `displayName` for UI text. Display
+    /// metadata, locality and grouping live in `LLM/LLMProviderInfo.swift`.
     enum LLMProvider: String, CaseIterable, Codable, Sendable {
+        /// Default for new users: best available on-device option
+        /// (downloaded MLX model, else Apple Intelligence). Never cloud.
+        case automaticLocal = "Automatic (On-Device)"
+        /// Apple's on-device foundation model (Apple Intelligence). No download.
+        case appleOnDevice = "Apple Intelligence"
         case ollama = "Ollama"
         case lmStudio = "LM Studio"
         case mlx = "Local (MLX)"
         case openai = "OpenAI"
         case anthropic = "Anthropic"
+        /// Raw value kept for stored settings; Cerebras is no longer free.
         case cerebras = "Cerebras (Free)"
         case deepseek = "DeepSeek"
         case nvidiaNIM = "NVIDIA NIM"
         case openRouter = "OpenRouter"
+        case gemini = "Google Gemini"
+        case groq = "Groq"
+        /// Any OpenAI-compatible endpoint (base URL + key + model).
+        case openAICompatible = "OpenAI-Compatible"
+        /// The user's ChatGPT plan through OpenAI's official Codex CLI,
+        /// run as a subprocess (`codex exec`). Cloud. No API key.
+        case codexCLI = "ChatGPT plan (via Codex)"
+        /// The user's SuperGrok / X Premium plan through xAI's official Grok
+        /// CLI, run as a subprocess (`grok -p`). Cloud. No API key.
+        case grokCLI = "SuperGrok plan (via Grok CLI)"
+
+        /// Decodes a stored value: current raw values, display names, and
+        /// legacy spellings. Returns nil for unknown values.
+        init?(storedValue: String) {
+            let trimmed = storedValue.trimmingCharacters(in: .whitespacesAndNewlines)
+            if let exact = LLMProvider(rawValue: trimmed) {
+                self = exact
+                return
+            }
+            let folded = trimmed.lowercased()
+            if let match = LLMProvider.allCases.first(where: {
+                $0.rawValue.lowercased() == folded || $0.displayName.lowercased() == folded
+            }) {
+                self = match
+                return
+            }
+            if let legacy = LLMProvider.legacyAliases[folded] {
+                self = legacy
+                return
+            }
+            return nil
+        }
+
+        private static let legacyAliases: [String: LLMProvider] = [
+            "cerebras": .cerebras,
+            "mlx": .mlx,
+            "local mlx": .mlx,
+            "nvidia": .nvidiaNIM,
+            "nim": .nvidiaNIM,
+            "lmstudio": .lmStudio,
+            "automatic": .automaticLocal,
+            "gemini": .gemini,
+            "custom": .openAICompatible,
+            "codex": .codexCLI,
+            "chatgpt": .codexCLI,
+            "grok": .grokCLI,
+            "supergrok": .grokCLI,
+        ]
+
+        init(from decoder: Decoder) throws {
+            let container = try decoder.singleValueContainer()
+            let raw = try container.decode(String.self)
+            guard let value = LLMProvider(storedValue: raw) else {
+                throw DecodingError.dataCorruptedError(
+                    in: container,
+                    debugDescription: "Unknown LLM provider '\(raw)'"
+                )
+            }
+            self = value
+        }
+
+        func encode(to encoder: Encoder) throws {
+            var container = encoder.singleValueContainer()
+            try container.encode(rawValue)
+        }
     }
 
     enum TTSProvider: String, CaseIterable, Sendable {
@@ -527,7 +686,7 @@ final class AppSettings {
     struct VocabularyEntry: Identifiable, Codable, Sendable, Equatable {
         var id = UUID()
         var heardAs: String    // What the STT engine produces (e.g., "buffer")
-        var replaceTo: String  // What it should be (e.g., "WAFR")
+        var replaceTo: String  // What it should be (e.g., "TAPR")
         var caseSensitive: Bool = false
     }
 
@@ -554,10 +713,23 @@ final class AppSettings {
         autoStart = defaults.bool(forKey: "autoStart")
         appearanceMode = AppearanceMode(rawValue: defaults.string(forKey: "appearanceMode") ?? "") ?? .system
 
+        localOnlyMode = defaults.bool(forKey: PrivacyGate.localOnlyModeKey)
+        siriReadsMeetingContent = defaults.object(forKey: "siriReadsMeetingContent") as? Bool ?? true
+        consentReminderEnabled = defaults.object(forKey: "consentReminderEnabled") as? Bool ?? true
+        allPartyConsentMode = defaults.bool(forKey: "allPartyConsentMode")
+        fetchCompanyLogos = defaults.bool(forKey: "fetchCompanyLogos")
+        autoAssignProjects = defaults.bool(forKey: "autoAssignProjects")
+        commentToAIEnabled = defaults.object(forKey: "commentToAIEnabled") as? Bool ?? true
+
         loadFavoritePersonIDs()
         loadRecurrenceMap()
         loadTemplates()
+        defaultTemplateID = defaults.string(forKey: "defaultTemplateID") ?? ""
     }
+
+    /// First line of the template-choice prompt; `LLMRequestClassifier`
+    /// routes it as `.templateDetection`.
+    nonisolated static let templateDetectionMarker = "Given this meeting transcript excerpt and the available templates, which template best fits this meeting?"
 
     // MARK: - Forwarding Methods
 
@@ -633,8 +805,22 @@ final class AppSettings {
 
     // MARK: - Template Resolution
 
-    /// Synchronous template resolution: recurrence memory -> rule matching -> fallback to general.
+    /// The template used when nothing else picks one: the user's default, or General.
+    var defaultTemplate: MeetingTemplate {
+        guard let id = UUID(uuidString: defaultTemplateID),
+              let template = meetingTemplates.first(where: { $0.id == id }) else {
+            return MeetingTemplate.general
+        }
+        return template
+    }
+
+    /// Synchronous template resolution: recurrence memory -> rule matching -> the default template.
     func resolveTemplate(for meeting: Meeting) -> MeetingTemplate {
+        matchedTemplate(for: meeting) ?? defaultTemplate
+    }
+
+    /// A template picked by recurrence memory or a rule, or nil when neither applies.
+    func matchedTemplate(for meeting: Meeting) -> MeetingTemplate? {
         // Tier 1: Recurrence memory
         if let eventID = meeting.calendarEventID,
            let templateIDStr = templateRecurrenceMap[eventID],
@@ -658,15 +844,15 @@ final class AppSettings {
             }
         }
 
-        return MeetingTemplate.general
+        return nil
     }
 
     /// Async template resolution with LLM fallback for ambiguous cases.
     func resolveTemplateAsync(for meeting: Meeting, transcript: String, llmClient: any LLMClient, model: String) async -> MeetingTemplate {
-        let syncResult = resolveTemplate(for: meeting)
-        if syncResult.id != MeetingTemplate.general.id {
-            return syncResult
+        if let matched = matchedTemplate(for: meeting) {
+            return matched
         }
+        let syncResult = defaultTemplate
 
         // Tier 3: LLM selection (only when sync falls through to general)
         guard meetingTemplates.count > 1 else { return syncResult }
@@ -677,7 +863,7 @@ final class AppSettings {
 
         let excerpt = String(transcript.prefix(2000))
         let prompt = """
-        Given this meeting transcript excerpt and the available templates, which template best fits this meeting?
+        \(Self.templateDetectionMarker)
         Return ONLY the template UUID, nothing else.
 
         Templates:

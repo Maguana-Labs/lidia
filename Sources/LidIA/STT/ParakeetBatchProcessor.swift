@@ -16,14 +16,46 @@ actor ParakeetBatchProcessor {
         batchLogger.info("Transcribe-only: \(String(format: "%.1f", duration))s of audio")
 
         let models = try await AsrModels.downloadAndLoad(version: .v3)
-        let asrManager = AsrManager(config: .default)
-        try await asrManager.initialize(models: models)
-        try await Self.configureVocabulary(asrManager: asrManager, vocabulary: vocabulary)
-        let result = try await asrManager.transcribe(samples, source: .microphone)
-        let words: [TranscriptWord] = (result.tokenTimings ?? []).map { timing in
-            TranscriptWord(word: timing.token, start: timing.startTime, end: timing.endTime, confidence: Double(result.confidence))
-        }
+        let result = try await Self.transcribe(samples, models: models)
+        // tokenTimings are sub-word pieces; join them into whole words.
+        let words = Self.mergeTokens(
+            (result.tokenTimings ?? []).map { (token: $0.token, start: $0.startTime, end: $0.endTime) },
+            confidence: Double(result.confidence)
+        )
         batchLogger.info("Transcribe-only produced \(words.count) words")
+        return words
+    }
+
+    /// Joins SentencePiece tokens into words. A token with a leading space ("▁" decoded)
+    /// starts a new word; tokens without one continue the current word.
+    static func mergeTokens(
+        _ tokens: [(token: String, start: TimeInterval, end: TimeInterval)],
+        confidence: Double
+    ) -> [TranscriptWord] {
+        var words: [TranscriptWord] = []
+        var currentWord = ""
+        var wordStart: TimeInterval = 0
+        var wordEnd: TimeInterval = 0
+
+        func commit() {
+            let trimmed = currentWord.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !trimmed.isEmpty {
+                words.append(TranscriptWord(word: trimmed, start: wordStart, end: wordEnd, confidence: confidence, speaker: nil))
+            }
+            currentWord = ""
+        }
+
+        for timing in tokens {
+            let isWordBoundary = timing.token.hasPrefix(" ")
+            if isWordBoundary { commit() }
+            let stripped = isWordBoundary ? String(timing.token.dropFirst()) : timing.token
+            if currentWord.isEmpty {
+                wordStart = timing.start
+            }
+            currentWord += stripped
+            wordEnd = timing.end
+        }
+        commit()
         return words
     }
 
@@ -43,57 +75,13 @@ actor ParakeetBatchProcessor {
 
         // Step A: Batch ASR with word timings
         let models = try await AsrModels.downloadAndLoad(version: .v3)
-        let asrManager = AsrManager(config: .default)
-        try await asrManager.initialize(models: models)
-        try await Self.configureVocabulary(asrManager: asrManager, vocabulary: vocabulary)
-
-        let result = try await asrManager.transcribe(samples, source: .microphone)
-        await asrManager.cleanup()
+        let result = try await Self.transcribe(samples, models: models)
 
         // Merge sub-word tokens into whole words.
-        // tokenTimings contains SentencePiece tokens where "▁" is replaced with " ".
-        // A token starting with " " (space) marks a new word boundary.
-        // Consecutive tokens without leading space are continuations of the current word.
-        var words: [TranscriptWord] = []
-        var currentWord = ""
-        var wordStart: TimeInterval = 0
-        var wordEnd: TimeInterval = 0
-
-        for timing in result.tokenTimings ?? [] {
-            let token = timing.token
-            let isWordBoundary = token.hasPrefix(" ")
-
-            if isWordBoundary && !currentWord.isEmpty {
-                // Save the completed word
-                words.append(TranscriptWord(
-                    word: currentWord,
-                    start: wordStart,
-                    end: wordEnd,
-                    confidence: Double(result.confidence),
-                    speaker: nil
-                ))
-                currentWord = ""
-            }
-
-            // Append token text (strip leading space from boundary tokens)
-            let stripped = isWordBoundary ? String(token.dropFirst()) : token
-            if currentWord.isEmpty {
-                wordStart = timing.startTime
-            }
-            currentWord += stripped
-            wordEnd = timing.endTime
-        }
-
-        // Don't forget the last word
-        if !currentWord.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            words.append(TranscriptWord(
-                word: currentWord.trimmingCharacters(in: .whitespacesAndNewlines),
-                start: wordStart,
-                end: wordEnd,
-                confidence: Double(result.confidence),
-                speaker: nil
-            ))
-        }
+        var words = Self.mergeTokens(
+            (result.tokenTimings ?? []).map { (token: $0.token, start: $0.startTime, end: $0.endTime) },
+            confidence: Double(result.confidence)
+        )
 
         batchLogger.info("ASR produced \(words.count) words from \((result.tokenTimings ?? []).count) tokens")
 
@@ -158,31 +146,21 @@ actor ParakeetBatchProcessor {
         return words
     }
 
-    // MARK: - Custom Vocabulary
+    // MARK: - ASR
 
-    /// Configure FluidAudio vocabulary boosting on an AsrManager from LidIA vocabulary entries.
-    /// Downloads CTC models on first use, then maps VocabularyEntry → CustomVocabularyTerm.
-    private static func configureVocabulary(
-        asrManager: AsrManager,
-        vocabulary: [AppSettings.VocabularyEntry]
-    ) async throws {
-        guard !vocabulary.isEmpty else { return }
-
-        let terms = vocabulary.map { entry in
-            CustomVocabularyTerm(
-                text: entry.replaceTo,
-                weight: 10.0,
-                aliases: [entry.heardAs]
-            )
-        }
-        let context = CustomVocabularyContext(terms: terms)
-        let ctcModels = try await CtcModels.downloadAndLoad()
-
-        try await asrManager.configureVocabularyBoosting(
-            vocabulary: context,
-            ctcModels: ctcModels
-        )
-        batchLogger.info("Vocabulary boosting configured with \(terms.count) terms")
+    /// One batch pass with a fresh decoder state.
+    ///
+    /// `vocabulary` isn't passed to FluidAudio: its CTC vocabulary boosting (removed from the
+    /// batch AsrManager in FluidAudio 0.13) only rewrote `ASRResult.text`, while words here
+    /// come from `tokenTimings`, so it never changed LidIA's transcript. Custom vocabulary
+    /// still reaches the meeting pipeline, which uses it when refining the transcript.
+    private static func transcribe(_ samples: [Float], models: AsrModels) async throws -> ASRResult {
+        let asrManager = AsrManager(config: .default)
+        try await asrManager.loadModels(models)
+        var decoderState = TdtDecoderState.make()
+        let result = try await asrManager.transcribe(samples, decoderState: &decoderState)
+        await asrManager.cleanup()
+        return result
     }
 
     // MARK: - Local Speaker Assignment

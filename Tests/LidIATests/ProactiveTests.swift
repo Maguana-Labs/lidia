@@ -47,5 +47,6 @@ import Testing
         NotificationDispatcher.Category.preMeetingPrep.rawValue,
         NotificationDispatcher.Category.postMeetingNudge.rawValue,
         NotificationDispatcher.Category.actionItemReminder.rawValue,
+        NotificationDispatcher.Category.processingFailed.rawValue,
     ])
 }

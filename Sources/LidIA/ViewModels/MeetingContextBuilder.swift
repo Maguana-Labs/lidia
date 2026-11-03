@@ -22,6 +22,9 @@ final class MeetingContextBuilder {
     private var modelContext: ModelContext?
     private var selectedMeeting: Meeting?
 
+    /// The meeting the user is looking at, if any.
+    var currentSelectedMeeting: Meeting? { selectedMeeting }
+
     // MARK: - Configuration
 
     func configure(modelContext: ModelContext) {
@@ -185,6 +188,16 @@ final class MeetingContextBuilder {
             return .medium
         }
         return .low
+    }
+
+    /// The confidence badge to show, or nil for answers that didn't draw on meetings
+    /// (small talk, general questions), which shouldn't be labelled "Low confidence".
+    func displayedConfidence(answer: String, sourceCount: Int) -> ChatBarMessage.GroundingConfidence? {
+        let normalized = answer.lowercased()
+        if sourceCount == 0 && !normalized.contains("[error:") && !indicatesInsufficientEvidence(in: normalized) {
+            return nil
+        }
+        return deriveGroundingConfidence(answer: answer, sourceCount: sourceCount)
     }
 
     /// Fetches meetings for suggestion logic (checks if any meetings exist).

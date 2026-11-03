@@ -18,8 +18,11 @@ enum ActionItemDispatcher {
         destination: String,
         settings: AppSettings,
         eventKitManager: EventKitManager,
-        modelContext: ModelContext
+        modelContext: ModelContext,
+        titleOverride: String? = nil,
+        note: String? = nil
     ) async throws {
+        let title = titleOverride?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty ?? item.title
         switch destination {
         case "notion":
             _ = try await ActionItemNotionSyncService.sync(
@@ -31,7 +34,7 @@ enum ActionItemDispatcher {
         case "reminder":
             let reminderID = await eventKitManager.syncReminder(
                 reminderID: item.reminderID,
-                title: item.title,
+                title: title,
                 deadlineText: item.displayDeadline,
                 deadlineDate: item.deadlineDate,
                 isCompleted: item.isCompleted
@@ -39,6 +42,7 @@ enum ActionItemDispatcher {
             item.reminderID = reminderID
 
         case "n8n":
+            try PrivacyGate.check(.n8n)
             guard settings.n8nEnabled, !settings.n8nWebhookURL.isEmpty else {
                 throw DispatchError.notConfigured("n8n")
             }
@@ -48,7 +52,7 @@ enum ActionItemDispatcher {
                 duration: 0,
                 summary: "",
                 actionItems: [N8nClient.ActionItemPayload(
-                    title: item.title,
+                    title: title,
                     assignee: item.assignee,
                     deadline: item.displayDeadline
                 )],
@@ -62,18 +66,59 @@ enum ActionItemDispatcher {
             )
 
         case "clickup":
+            try PrivacyGate.check(.clickUp)
             guard !settings.clickUpAPIKey.isEmpty, !settings.clickUpListID.isEmpty else {
                 throw DispatchError.notConfigured("ClickUp")
             }
+            var description = "From meeting: \(meetingTitle)\nAssignee: \(item.assignee ?? "Unassigned")\nDeadline: \(item.displayDeadline ?? "None")"
+            if let note, !note.isEmpty { description = note + "\n\n" + description }
             try await ClickUpClient.createTask(
-                title: item.title,
-                description: "From meeting: \(meetingTitle)\nAssignee: \(item.assignee ?? "Unassigned")\nDeadline: \(item.displayDeadline ?? "None")",
+                title: title,
+                description: description,
                 listID: settings.clickUpListID,
                 apiKey: settings.clickUpAPIKey
+            )
+
+        case "linear":
+            try PrivacyGate.check(.linear)
+            guard !settings.linearAPIKey.isEmpty, !settings.linearTeamID.isEmpty else {
+                throw DispatchError.notConfigured("Linear")
+            }
+            var description = "From meeting: \(meetingTitle)\nAssignee: \(item.assignee ?? "Unassigned")\nDeadline: \(item.displayDeadline ?? "None")"
+            if let note, !note.isEmpty { description = note + "\n\n" + description }
+            try await LinearClient.createIssue(
+                title: title,
+                description: description,
+                teamID: settings.linearTeamID,
+                apiKey: settings.linearAPIKey
             )
 
         default:
             break
         }
+        DispatchHistory.record(destination)
     }
+}
+
+/// Where the user has sent action items before, most recent last, so
+/// intents can rank destinations by habit. Kept in user defaults (a list
+/// of destination identifiers, capped), never meeting content.
+enum DispatchHistory {
+    static let key = "actionItemDispatchHistory"
+    static let limit = 50
+
+    static func record(_ destination: String, defaults: UserDefaults = .standard) {
+        var list = defaults.stringArray(forKey: key) ?? []
+        list.append(destination)
+        defaults.set(Array(list.suffix(limit)), forKey: key)
+    }
+
+    /// Destination → how many of the recent dispatches went there.
+    static func counts(defaults: UserDefaults = .standard) -> [String: Int] {
+        (defaults.stringArray(forKey: key) ?? []).reduce(into: [:]) { $0[$1, default: 0] += 1 }
+    }
+}
+
+private extension String {
+    var nilIfEmpty: String? { isEmpty ? nil : self }
 }

@@ -1,9 +1,19 @@
 import Foundation
 
+/// Persistent FIFO of meeting IDs waiting for (re)processing. Drained by
+/// `PostProcessingService.drainQueuedMeetings` every 60 s and at launch.
+///
+/// Stable API used by other workstreams: `shared`, `enqueue(_:)`, `remove(_:)`, `all()`, `clear()`.
 actor DeferredMeetingProcessingQueue {
     static let shared = DeferredMeetingProcessingQueue()
 
-    private let defaultsKey = "meetingProcessingQueue.v1"
+    private let defaults: UserDefaults
+    private let defaultsKey: String
+
+    init(defaults: UserDefaults = .standard, defaultsKey: String = "meetingProcessingQueue.v1") {
+        self.defaults = defaults
+        self.defaultsKey = defaultsKey
+    }
 
     func enqueue(_ meetingID: UUID) {
         var queue = loadQueue()
@@ -28,7 +38,7 @@ actor DeferredMeetingProcessingQueue {
     }
 
     private func loadQueue() -> [UUID] {
-        guard let data = UserDefaults.standard.data(forKey: defaultsKey),
+        guard let data = defaults.data(forKey: defaultsKey),
               let ids = try? JSONDecoder().decode([UUID].self, from: data) else {
             return []
         }
@@ -37,6 +47,6 @@ actor DeferredMeetingProcessingQueue {
 
     private func saveQueue(_ queue: [UUID]) {
         guard let data = try? JSONEncoder().encode(queue) else { return }
-        UserDefaults.standard.set(data, forKey: defaultsKey)
+        defaults.set(data, forKey: defaultsKey)
     }
 }

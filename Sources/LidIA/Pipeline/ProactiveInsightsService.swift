@@ -85,7 +85,8 @@ final class ProactiveInsightsService {
                 eventID: "google:\(ge.id)",
                 title: ge.title,
                 start: ge.start,
-                attendees: ge.attendees
+                attendees: ge.attendees,
+                rawEventID: ge.id
             ))
         }
 
@@ -96,22 +97,36 @@ final class ProactiveInsightsService {
                 eventID: "apple:\(ae.id)",
                 title: ae.title,
                 start: ae.start,
-                attendees: ae.attendees
+                attendees: ae.attendees,
+                rawEventID: ae.id
             ))
         }
 
         guard !candidates.isEmpty else { return }
 
-        // Filter out events we've already briefed.
-        let existingBriefedIDs = existingPrepEventIDs(modelContext: modelContext)
-        let fresh = candidates.filter { !existingBriefedIDs.contains($0.eventID) }
+        let descriptor = FetchDescriptor<Meeting>(sortBy: [SortDescriptor(\Meeting.date, order: .reverse)])
+        let library = (try? modelContext.fetch(descriptor)) ?? []
+
+        // Filter out events we've already briefed. A brief that wrongly called a
+        // recurring meeting a first encounter (before history matching used
+        // titles) is replaced once history is found.
+        let existing = existingPrepBriefs(modelContext: modelContext)
+        var fresh: [(PrepCandidate, PrepBrief.Context)] = []
+        for candidate in candidates.sorted(by: { $0.start < $1.start }) {
+            let context = PrepBrief.context(for: candidate.upcoming, library: library)
+            if let old = existing[candidate.eventID] {
+                guard context.hasHistory, Self.claimsFirstEncounter(old.body) else { continue }
+                modelContext.delete(old)
+            }
+            fresh.append((candidate, context))
+        }
         guard !fresh.isEmpty else { return }
 
         // Generate at most N briefs per tick, soonest-starting first.
-        let toBrief = fresh.sorted { $0.start < $1.start }.prefix(maxBriefsPerTick)
-        for candidate in toBrief {
+        for (candidate, context) in fresh.prefix(maxBriefsPerTick) {
             await generateBrief(
                 candidate: candidate,
+                context: context,
                 settings: settings,
                 modelManager: modelManager,
                 modelContext: modelContext
@@ -119,59 +134,24 @@ final class ProactiveInsightsService {
         }
     }
 
+    /// True for briefs written by the old prompt for "no history" meetings.
+    nonisolated static func claimsFirstEncounter(_ text: String) -> Bool {
+        let lower = text.lowercased()
+        return ["first-encounter", "first encounter", "first meeting", "no prior meetings", "primer encuentro", "primera reunión"]
+            .contains { lower.contains($0) }
+    }
+
     // MARK: - Brief generation
 
     private func generateBrief(
         candidate: PrepCandidate,
+        context: PrepBrief.Context,
         settings: AppSettings,
         modelManager: ModelManager?,
         modelContext: ModelContext
     ) async {
-        let descriptor = FetchDescriptor<Meeting>(sortBy: [SortDescriptor(\Meeting.date, order: .reverse)])
-        let allMeetings = (try? modelContext.fetch(descriptor)) ?? []
-        let completed = allMeetings.filter { $0.status == .complete }
-        let related = MeetingContextRetrievalService.meetingsForAttendees(
-            candidate.attendees,
-            in: completed,
-            limit: 4
-        )
-        let openItems = related
-            .flatMap(\.actionItems)
-            .filter { !$0.isCompleted }
-
-        let hasPriorContext = !related.isEmpty || !openItems.isEmpty
-        let contextString = buildContextString(
-            candidate: candidate,
-            related: related,
-            openItems: openItems,
-            hasPriorContext: hasPriorContext
-        )
-
-        let prompt: String
-        if hasPriorContext {
-            prompt = """
-            You are a meeting prep assistant. In 2–3 short sentences (no bullets, no preamble), \
-            summarize what the user should know walking into this meeting. Reference the most \
-            relevant prior context and call out open action items only if they're directly relevant. \
-            Be specific.
-
-            \(contextString)
-            """
-        } else {
-            // First-encounter brief — no prior meetings with these attendees. Keep it
-            // short, set the stage, and prompt the user to think about what they want.
-            prompt = """
-            You are a meeting prep assistant. The user has no prior meetings with these \
-            attendees on record. In 2 short sentences (no bullets, no preamble), state that this \
-            looks like a first-encounter meeting and suggest one or two concrete things to \
-            think about based on the title and attendees. Do not invent facts.
-
-            \(contextString)
-            """
-        }
-
-        let client = makeLLMClient(settings: settings, modelManager: modelManager, taskType: .summarization)
-        let model = effectiveModel(for: .summary, settings: settings, taskType: .summarization)
+        let client = makeLLMClient(settings: settings, modelManager: modelManager, taskType: .prepBrief)
+        let model = effectiveModel(for: .summary, settings: settings, taskType: .prepBrief)
         guard !model.isEmpty else {
             Self.logger.info("No model configured for summarization (provider: \(settings.llmProvider.rawValue, privacy: .public)); skipping brief")
             return
@@ -179,11 +159,11 @@ final class ProactiveInsightsService {
 
         do {
             let brief = try await client.chat(
-                messages: [LLMChatMessage(role: "user", content: prompt)],
+                messages: [LLMChatMessage(role: "user", content: context.prompt)],
                 model: model,
                 format: nil
             )
-            let trimmed = brief.trimmingCharacters(in: .whitespacesAndNewlines)
+            let trimmed = MapReduceSummarizer.stripThinking(brief)
             guard !trimmed.isEmpty else { return }
 
             let payload = InboxNotification.encodePayload(
@@ -198,74 +178,25 @@ final class ProactiveInsightsService {
             )
             modelContext.insert(notif)
             try? modelContext.save()
-            Self.logger.info("Generated prep brief for \(candidate.title, privacy: .public)")
+            Self.logger.info("Generated prep brief for \(candidate.title, privacy: .public) from \(context.matchedMeetingIDs.count, privacy: .public) earlier meetings")
         } catch {
             Self.logger.error("Brief generation failed for \(candidate.eventID, privacy: .public): \(error.localizedDescription)")
         }
     }
 
-    private func buildContextString(
-        candidate: PrepCandidate,
-        related: [Meeting],
-        openItems: [ActionItem],
-        hasPriorContext: Bool
-    ) -> String {
-        var lines: [String] = []
-        lines.append("UPCOMING MEETING: \(candidate.title)")
-        lines.append("STARTS: \(candidate.start.formatted(date: .abbreviated, time: .shortened))")
-        let attendeesPreview = candidate.attendees.prefix(6).joined(separator: ", ")
-        lines.append("ATTENDEES: \(attendeesPreview)")
-
-        if !hasPriorContext {
-            lines.append("")
-            lines.append("(No prior meetings with these attendees on record.)")
-            return lines.joined(separator: "\n")
-        }
-
-        if let last = related.first {
-            lines.append("")
-            lines.append("LAST MEETING WITH THESE ATTENDEES: \(last.title) on \(last.date.formatted(date: .abbreviated, time: .omitted))")
-            let summary = MeetingContextRetrievalService.effectiveSummary(for: last)
-            if !summary.isEmpty {
-                let snippet = String(summary.prefix(500))
-                lines.append("SUMMARY: \(snippet)")
-            }
-        }
-
-        if related.count > 1 {
-            lines.append("")
-            lines.append("OTHER RECENT MEETINGS WITH THESE ATTENDEES:")
-            for meeting in related.dropFirst().prefix(3) {
-                lines.append("- \(meeting.title) (\(meeting.date.formatted(date: .abbreviated, time: .omitted)))")
-            }
-        }
-
-        if !openItems.isEmpty {
-            lines.append("")
-            lines.append("OPEN ACTION ITEMS FROM PRIOR MEETINGS:")
-            for item in openItems.prefix(8) {
-                var line = "- \(item.title)"
-                if let assignee = item.assignee, !assignee.isEmpty {
-                    line += " (assignee: \(assignee))"
-                }
-                if let deadline = item.displayDeadline {
-                    line += " (due: \(deadline))"
-                }
-                lines.append(line)
-            }
-        }
-
-        return lines.joined(separator: "\n")
-    }
-
     // MARK: - Dedup
 
-    private func existingPrepEventIDs(modelContext: ModelContext) -> Set<String> {
+    private func existingPrepBriefs(modelContext: ModelContext) -> [String: InboxNotification] {
         let descriptor = FetchDescriptor<InboxNotification>(
             predicate: #Predicate<InboxNotification> { $0.type == "meeting_prep" }
         )
         let existing = (try? modelContext.fetch(descriptor)) ?? []
-        return Set(existing.compactMap { $0.sourceEventID })
+        var byEvent: [String: InboxNotification] = [:]
+        for notification in existing {
+            guard let eventID = notification.sourceEventID else { continue }
+            byEvent[eventID] = notification
+        }
+        return byEvent
     }
 }
 
@@ -274,4 +205,9 @@ private struct PrepCandidate {
     let title: String
     let start: Date
     let attendees: [String]
+    let rawEventID: String
+
+    var upcoming: MeetingHistoryMatcher.Upcoming {
+        MeetingHistoryMatcher.Upcoming(title: title, attendees: attendees, calendarEventIDs: [rawEventID], start: start)
+    }
 }

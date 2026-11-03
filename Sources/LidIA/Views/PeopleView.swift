@@ -25,7 +25,7 @@ struct PeopleView: View {
                 ContentUnavailableView(
                     "No People Yet",
                     systemImage: "person.2",
-                    description: Text("People will appear here after meetings with calendar attendees")
+                    description: Text("Everyone you meet shows up here, grouped by company, once a meeting has attendees from your calendar or an import.")
                 )
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else {
@@ -99,6 +99,9 @@ struct PeopleView: View {
                         }
                     }
                 }
+                .scrollContentBackground(.hidden)
+                .frame(maxWidth: 820)
+                .frame(maxWidth: .infinity)
                 .navigationDestination(for: String.self) { profileID in
                     if let profile = profiles.first(where: { $0.id == profileID }) {
                         PersonDetailView(
@@ -110,20 +113,23 @@ struct PeopleView: View {
             }
         }
         .onAppear { refresh() }
+        // Rebuild after any save (this window, sync, MCP inbox, voice) so the
+        // profiles never point at deleted meetings or action items.
+        .onReceive(NotificationCenter.default.publisher(for: ModelContext.didSave).receive(on: DispatchQueue.main)) { _ in
+            refresh()
+        }
         .navigationTitle("People")
     }
 
     private func refresh() {
-        let userName = settings.displayName.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        profiles = relationshipStore.buildProfiles(modelContext: modelContext)
-            .filter { userName.isEmpty || !$0.id.contains(userName) }
+        profiles = relationshipStore.buildProfiles(modelContext: modelContext, currentUserName: settings.displayName)
 
         // Build companies from all meetings
         let descriptor = FetchDescriptor<Meeting>(
             sortBy: [SortDescriptor(\.date, order: .reverse)]
         )
         let allMeetings = (try? modelContext.fetch(descriptor)) ?? []
-        companies = relationshipStore.companies(from: allMeetings)
+        companies = relationshipStore.companies(from: allMeetings, currentUserName: settings.displayName)
     }
 
     private func companyAttendeeProfiles(for company: Company) -> [RelationshipStore.PersonProfile] {
@@ -150,43 +156,38 @@ private struct CompanyRow: View {
     let company: Company
 
     var body: some View {
-        HStack {
-            AsyncImage(url: URL(string: "https://www.google.com/s2/favicons?domain=\(company.domain)&sz=32")) { phase in
-                switch phase {
-                case .success(let image):
-                    image.resizable().frame(width: 20, height: 20)
-                default:
-                    Image(systemName: "building.2")
-                        .font(.caption)
-                }
-            }
-            .foregroundStyle(.secondary)
-            .frame(width: 32, height: 32)
+        HStack(spacing: 12) {
+            // Local monogram by default; never sends company domains to a favicon proxy.
+            CompanyLogoView(domain: company.domain, name: company.name)
+                .frame(width: 32, height: 32)
             VStack(alignment: .leading, spacing: 2) {
                 Text(company.name)
-                    .font(.subheadline.bold())
-                Text(company.domain)
-                    .font(.caption)
+                    .font(.body.weight(.medium))
+                Text(subtitle)
+                    .font(.callout)
                     .foregroundStyle(.secondary)
-                HStack(spacing: 8) {
-                    Text("\(company.meetingCount) meeting\(company.meetingCount == 1 ? "" : "s")")
-                    Text("\(company.attendeeEmails.count) attendee\(company.attendeeEmails.count == 1 ? "" : "s")")
-                    if let lastDate = company.lastMeetingDate {
-                        Text("Last: \(lastDate.formatted(date: .abbreviated, time: .omitted))")
-                    }
-                }
-                .font(.caption)
-                .foregroundStyle(.secondary)
+                    .lineLimit(1)
             }
             Spacer()
             if company.openActionItems > 0 {
-                Text("\(company.openActionItems)")
-                    .font(.caption2)
-                    .padding(.horizontal, 6)
-                    .padding(.vertical, 2)
-                    .background(.orange.opacity(0.2))
-                    .clipShape(Capsule())
+                Text("\(company.openActionItems) open")
+                    .font(.caption.weight(.medium))
+                    .foregroundStyle(.orange)
+                    .padding(.horizontal, 7)
+                    .frame(height: 20)
+                    .background(Color.orange.opacity(0.14), in: Capsule())
             }
         }
+        .padding(.vertical, 3)
+        .accessibilityElement(children: .combine)
+    }
+
+    private var subtitle: String {
+        var parts = [
+            "\(company.attendeeEmails.count) \(company.attendeeEmails.count == 1 ? "person" : "people")",
+            "\(company.meetingCount) meeting\(company.meetingCount == 1 ? "" : "s")",
+        ]
+        if let last = company.lastMeetingDate { parts.append("last met \(MeetingRowFormat.relativeDay(last, timeForToday: false))") }
+        return parts.joined(separator: " · ")
     }
 }

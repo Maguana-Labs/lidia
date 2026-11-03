@@ -1,4 +1,5 @@
 @preconcurrency import AVFoundation
+import CoreGraphics
 import Observation
 import os
 
@@ -12,6 +13,18 @@ enum AudioCaptureError: Error, LocalizedError {
             "Microphone permission denied. Grant access in System Settings > Privacy & Security > Microphone."
         case .micUnavailable(let detail):
             "Microphone unavailable: \(detail)"
+        }
+    }
+}
+
+extension AudioCaptureError {
+    /// Throws when the input has no usable format. With no input device (a Mac mini or
+    /// Studio with nothing plugged in, a closed laptop) the input node reports 0 Hz or 0
+    /// channels, and installing a tap with that format raises an Objective-C exception,
+    /// which can't be caught in Swift.
+    nonisolated static func checkInputFormat(sampleRate: Double, channelCount: AVAudioChannelCount) throws {
+        guard sampleRate.isFinite, sampleRate > 0, channelCount > 0 else {
+            throw AudioCaptureError.micUnavailable(String(localized: "No microphone is connected or available."))
         }
     }
 }
@@ -50,9 +63,18 @@ final class AudioCaptureManager {
         var sourceEvents: [AudioSourceEvent] = []
         var accumulatedMicSamples: [Float] = []
         var accumulatedSystemSamples: [Float] = []
+        /// While paused, captured audio is dropped (mic tap removed; system chunks skipped).
+        var isPaused = false
     }
 
     nonisolated let tapState = OSAllocatedUnfairLock(initialState: AudioTapState())
+
+    /// Disk recorder for the current capture, read from audio callback threads.
+    nonisolated let recorderRef = OSAllocatedUnfairLock<MeetingAudioRecorder?>(initialState: nil)
+
+    /// Called on the main actor when system audio stops being captured (permission missing,
+    /// stream failure or stall) and the recording continues with the microphone only.
+    var onFallbackToMic: (@MainActor (String) -> Void)?
 
     /// Latest RMS value from the audio tap (thread-safe read).
     nonisolated var currentRMS: Float {
@@ -82,27 +104,49 @@ final class AudioCaptureManager {
         return stream
     }
 
-    func startCapture(mode: AudioCaptureMode = .micOnly) async throws {
+    /// Starts capturing. When a `recorder` is given, every captured chunk is also written to
+    /// disk and samples are not accumulated in memory.
+    func startCapture(mode: AudioCaptureMode = .micOnly, recorder: MeetingAudioRecorder? = nil) async throws {
         guard !isCapturing else { return }
         captureStatus = .healthy
         let (stream, continuation) = AsyncStream.makeStream(of: AudioChunk.self)
         _audioStream = stream
         _continuation = continuation
+        recorderRef.withLock { $0 = recorder }
+        shouldAccumulate = recorder == nil
+        tapState.withLock { $0.isPaused = false }
 
-        switch mode {
-        case .micOnly:
-            try await startMicOnlyCapture()
-            activeCaptureMode = .micOnly
-        case .micAndSystem:
-            do {
-                try await startSystemAudioCapture()
-                activeCaptureMode = .micAndSystem
-            } catch {
-                Self.logger.warning("System audio capture failed, falling back to mic only: \(error.localizedDescription)")
-                captureStatus = .fallbackToMic(error.localizedDescription)
+        do {
+            switch mode {
+            case .micOnly:
                 try await startMicOnlyCapture()
                 activeCaptureMode = .micOnly
+            case .micAndSystem:
+                if let reason = Self.systemAudioUnavailableReason() {
+                    // Don't let a missing permission become a silent failure: record the mic
+                    // and say why the other side isn't being captured.
+                    Self.logger.warning("System audio unavailable: \(reason)")
+                    try await startMicOnlyCapture()
+                    activeCaptureMode = .micOnly
+                    reportFallback(reason)
+                } else {
+                    do {
+                        try await startSystemAudioCapture()
+                        activeCaptureMode = .micAndSystem
+                    } catch {
+                        Self.logger.warning("System audio capture failed, falling back to mic only: \(error.localizedDescription)")
+                        try await startMicOnlyCapture()
+                        activeCaptureMode = .micOnly
+                        reportFallback("System audio couldn't start (\(error.localizedDescription)). Recording your microphone only.")
+                    }
+                }
             }
+        } catch {
+            recorderRef.withLock { $0 = nil }
+            _continuation?.finish()
+            _continuation = nil
+            _audioStream = nil
+            throw error
         }
 
         isCapturing = true
@@ -160,9 +204,14 @@ final class AudioCaptureManager {
         isPaused = true
         pauseStart = Date()
 
-        // Mute the tap — remove tap so no audio flows
+        // Mute the tap — remove tap so no audio flows. System audio keeps arriving from
+        // ScreenCaptureKit, so it is dropped via the paused flag instead.
         micEngine?.inputNode.removeTap(onBus: 0)
-        tapState.withLock { $0.rms = 0 }
+        tapState.withLock {
+            $0.rms = 0
+            $0.isPaused = true
+        }
+        recorderRef.withLock { $0 }?.pause()
     }
 
     func resumeCapture() {
@@ -172,33 +221,25 @@ final class AudioCaptureManager {
         }
         isPaused = false
         pauseStart = nil
+        recorderRef.withLock { $0 }?.resume()
+        tapState.withLock { $0.isPaused = false }
 
-        // Re-install the tap if mic engine is active
-        if let engine = micEngine {
-            let continuation = _continuation
-            let state = tapState
-            let accumulate = shouldAccumulate
-            engine.inputNode.installTap(onBus: 0, bufferSize: 4096, format: nil) {
-                buffer, _ in
-                guard let channelData = buffer.floatChannelData,
-                      buffer.frameLength > 0 else { return }
-                let sampleRate = Int(buffer.format.sampleRate)
-                let samples = Array(
-                    UnsafeBufferPointer(start: channelData[0], count: Int(buffer.frameLength))
+        // Re-install the tap if mic engine is active. Remove any tap first: the system
+        // audio watchdog can switch to the mic (installing a tap) while paused, and a
+        // second tap on the same bus raises an Objective-C exception.
+        if let engine = micEngine, let continuation = _continuation {
+            engine.inputNode.removeTap(onBus: 0)
+            engine.inputNode.installTap(
+                onBus: 0,
+                bufferSize: 4096,
+                format: nil,
+                block: Self.makeMicTapBlock(
+                    continuation: continuation,
+                    tapState: tapState,
+                    recorderRef: recorderRef,
+                    shouldAccumulate: shouldAccumulate
                 )
-                let chunk = AudioChunk(samples: samples, sampleRate: sampleRate, timestamp: Date().timeIntervalSince1970, source: .mic)
-                let rms = AudioChunk.computeRMS(samples)
-                state.withLock { s in
-                    s.rms = rms
-                    s.micRMS = rms
-                    s.sourceEvents.append(AudioSourceEvent(source: .mic, timestamp: chunk.timestamp, rms: rms))
-                    if accumulate {
-                        let resampled = AudioResampler.resample(samples, from: sampleRate, to: 16000)
-                        s.accumulatedMicSamples.append(contentsOf: resampled)
-                    }
-                }
-                continuation?.yield(chunk)
-            }
+            )
         }
     }
 
@@ -224,6 +265,8 @@ final class AudioCaptureManager {
         healthTask = nil
 
         isCapturing = false
+        isPaused = false
+        recorderRef.withLock { $0 = nil }
         tapState.withLock { state in
             state.rms = 0
             state.micRMS = 0
@@ -231,6 +274,7 @@ final class AudioCaptureManager {
             state.accumulatedMicSamples.removeAll(keepingCapacity: false)
             state.accumulatedSystemSamples.removeAll(keepingCapacity: false)
             state.sourceEvents.removeAll()
+            state.isPaused = false
         }
         _continuation?.finish()
         _continuation = nil
@@ -245,7 +289,12 @@ final class AudioCaptureManager {
             throw AudioCaptureError.micUnavailable("Audio stream not initialized")
         }
 
-        let engine = try Self.setupMicEngine(continuation: continuation, tapState: tapState, shouldAccumulate: shouldAccumulate)
+        let engine = try Self.setupMicEngine(
+            continuation: continuation,
+            tapState: tapState,
+            recorderRef: recorderRef,
+            shouldAccumulate: shouldAccumulate
+        )
         micEngine = engine
     }
 
@@ -263,9 +312,12 @@ final class AudioCaptureManager {
             throw AudioCaptureError.micUnavailable("Audio stream not initialized")
         }
         let state = tapState
+        let recorderRef = recorderRef
         systemForwardTask = Task {
             for await chunk in sourceStream {
                 if Task.isCancelled { break }
+                if state.withLock({ $0.isPaused }) { continue }
+                recorderRef.withLock { $0 }?.append(chunk)
                 continuation.yield(chunk)
                 let rms = AudioChunk.computeRMS(chunk.samples)
                 state.withLock { s in
@@ -318,9 +370,9 @@ final class AudioCaptureManager {
                         }
                     }
 
-                    self.captureStatus = .fallbackToMic("System audio unavailable, recording microphone only.")
                     do {
                         try await self.fallbackToMicOnly()
+                        self.reportFallback("System audio stopped responding. Recording your microphone only.")
                         return
                     } catch {
                         self.captureStatus = .failed("Audio capture failed: \(error.localizedDescription)")
@@ -360,10 +412,25 @@ final class AudioCaptureManager {
         let engine = try Self.setupMicEngine(
             continuation: continuation,
             tapState: tapState,
+            recorderRef: recorderRef,
             shouldAccumulate: shouldAccumulate
         )
         micEngine = engine
         activeCaptureMode = .micOnly
+    }
+
+    private func reportFallback(_ reason: String) {
+        captureStatus = .fallbackToMic(reason)
+        onFallbackToMic?(reason)
+    }
+
+    /// Why system audio can't be captured right now, or nil if it should work.
+    /// Asks for Screen Recording access once if it was never granted (non-blocking).
+    private static func systemAudioUnavailableReason() -> String? {
+        if CGPreflightScreenCaptureAccess() { return nil }
+        _ = CGRequestScreenCaptureAccess()
+        return "Screen Recording permission is off, so other participants aren't being captured. "
+            + "Recording your microphone only. Turn on LidIA in System Settings > Privacy & Security > Screen & System Audio Recording."
     }
 
     // MARK: - Mic Permission
@@ -389,16 +456,44 @@ final class AudioCaptureManager {
     private nonisolated static func setupMicEngine(
         continuation: AsyncStream<AudioChunk>.Continuation,
         tapState: OSAllocatedUnfairLock<AudioTapState>,
+        recorderRef: OSAllocatedUnfairLock<MeetingAudioRecorder?>,
         shouldAccumulate: Bool
     ) throws -> AVAudioEngine {
         let engine = AVAudioEngine()
         let inputNode = engine.inputNode
+        let hardwareFormat = inputNode.outputFormat(forBus: 0)
+        try AudioCaptureError.checkInputFormat(
+            sampleRate: hardwareFormat.sampleRate,
+            channelCount: hardwareFormat.channelCount
+        )
 
         // Use nil format to accept the hardware's native format.
         // installTap cannot resample — must match hardware.
-        inputNode.installTap(onBus: 0, bufferSize: 4096, format: nil) {
-            buffer, _ in
+        inputNode.installTap(
+            onBus: 0,
+            bufferSize: 4096,
+            format: nil,
+            block: makeMicTapBlock(
+                continuation: continuation,
+                tapState: tapState,
+                recorderRef: recorderRef,
+                shouldAccumulate: shouldAccumulate
+            )
+        )
 
+        engine.prepare()
+        try engine.start()
+        return engine
+    }
+
+    /// The mic tap: forwards each buffer to the live stream, the disk recorder and the meters.
+    private nonisolated static func makeMicTapBlock(
+        continuation: AsyncStream<AudioChunk>.Continuation,
+        tapState: OSAllocatedUnfairLock<AudioTapState>,
+        recorderRef: OSAllocatedUnfairLock<MeetingAudioRecorder?>,
+        shouldAccumulate: Bool
+    ) -> AVAudioNodeTapBlock {
+        { buffer, _ in
             guard let channelData = buffer.floatChannelData,
                   buffer.frameLength > 0 else { return }
 
@@ -417,7 +512,8 @@ final class AudioCaptureManager {
             )
             let rms = AudioChunk.computeRMS(samples)
             // Single lock acquisition for RMS + source events + optional accumulation
-            tapState.withLock { state in
+            let paused = tapState.withLock { state -> Bool in
+                guard !state.isPaused else { return true }
                 state.rms = rms
                 state.micRMS = rms
                 state.sourceEvents.append(AudioSourceEvent(source: .mic, timestamp: chunk.timestamp, rms: rms))
@@ -425,12 +521,11 @@ final class AudioCaptureManager {
                     let resampled = AudioResampler.resample(samples, from: sampleRate, to: 16000)
                     state.accumulatedMicSamples.append(contentsOf: resampled)
                 }
+                return false
             }
+            guard !paused else { return }
+            recorderRef.withLock { $0 }?.append(chunk)
             continuation.yield(chunk)
         }
-
-        engine.prepare()
-        try engine.start()
-        return engine
     }
 }

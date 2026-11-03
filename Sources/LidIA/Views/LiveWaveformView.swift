@@ -25,7 +25,7 @@ struct LiveWaveformView: View {
                     let rect = CGRect(x: x, y: y, width: barWidth, height: height)
                     context.fill(
                         Path(roundedRect: rect, cornerRadius: barWidth / 2),
-                        with: .color(isActive ? .red.opacity(0.8) : .secondary.opacity(0.3))
+                        with: .color(isActive ? Brand.red.opacity(0.8) : .secondary.opacity(0.3))
                     )
                 }
             }

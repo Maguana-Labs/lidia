@@ -1,0 +1,7 @@
+// Signing for the Xcode projects (LidIAiOS, LidIAWatch, scripts/icloud-provisioning).
+//
+// A fresh clone has no team: build with CODE_SIGNING_ALLOWED=NO, or set your own
+// team in Config/Local.xcconfig (gitignored), copied from Local.xcconfig.example.
+DEVELOPMENT_TEAM =
+
+#include? "Local.xcconfig"

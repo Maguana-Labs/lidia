@@ -27,6 +27,8 @@ actor OpenAITTSEngine: TTSEngine {
     }
 
     func synthesize(_ text: String) async throws -> Data {
+        // Spoken answers are built from meeting data: never send them in Local-only mode.
+        try PrivacyGate.checkAIEndpoint(baseURL, provider: "OpenAI voice")
         let url = baseURL.appendingPathComponent("v1/audio/speech")
         var request = URLRequest(url: url)
         request.httpMethod = "POST"

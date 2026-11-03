@@ -43,7 +43,12 @@ final class TTSModelManager {
             // TTS.loadModel() downloads from HuggingFace automatically and caches locally.
             Self.logger.info("Downloading TTS model: \(model.id)")
             downloadProgress = 0.1
-            _ = try await TTS.loadModel(modelRepo: model.id)
+            // Loading evaluates the weights on the GPU, so it shares the
+            // process-wide MLX lock (this also holds it during the download).
+            let repo = model.id
+            try await MLXInferenceLock.shared.run {
+                _ = try await TTS.loadModel(modelRepo: repo)
+            }
             downloadedModelIDs.insert(model.id)
             downloadProgress = 1.0
             Self.logger.info("TTS model downloaded: \(model.name)")

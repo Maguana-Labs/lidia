@@ -30,19 +30,13 @@ final class WhisperKitEngine: STTEngine {
 
         return AsyncStream { continuation in
             let task = Task { @Sendable in
-                // 1. Initialize WhisperKit (downloads model if needed on first use)
+                // 1. Get the shared WhisperKit (downloads model if needed on first use).
+                // Mic and system lanes each run an engine; sharing avoids loading the model twice.
                 Self.logger.info("Initializing with model: \(modelName.isEmpty ? "auto" : modelName)...")
-                let config: WhisperKitConfig
-                if modelName.isEmpty {
-                    config = WhisperKitConfig()
-                } else {
-                    config = WhisperKitConfig(model: modelName)
-                }
-
-                let whisperKit: WhisperKit
+                let whisperKit: SharedWhisperKit
                 do {
                     try Task.checkCancellation()
-                    whisperKit = try await WhisperKit(config)
+                    whisperKit = try await WhisperKitCache.shared.acquire(modelName: modelName)
                     Self.logger.info("Model loaded successfully")
                 } catch is CancellationError {
                     Self.logger.info("Transcription cancelled during model init")
@@ -114,6 +108,7 @@ final class WhisperKitEngine: STTEngine {
                 }
 
                 Self.logger.info("Transcription \(Task.isCancelled ? "cancelled" : "complete")")
+                await WhisperKitCache.shared.release(modelName: modelName)
                 continuation.finish()
             }
 
@@ -124,7 +119,7 @@ final class WhisperKitEngine: STTEngine {
     }
 
     private static func processChunk(
-        whisperKit: WhisperKit,
+        whisperKit: SharedWhisperKit,
         samples: [Float],
         baseTimestamp: TimeInterval,
         language: String? = nil
@@ -135,10 +130,7 @@ final class WhisperKitEngine: STTEngine {
                 wordTimestamps: true
             )
 
-            let results = await whisperKit.transcribe(
-                audioArrays: [samples],
-                decodeOptions: options
-            )
+            let results = await whisperKit.transcribe(samples: samples, options: options)
 
             var words: [TranscriptWord] = []
 
@@ -190,4 +182,76 @@ final class WhisperKitEngine: STTEngine {
         }
     }
 
+}
+
+/// A loaded WhisperKit pipeline shared by several engines. Transcriptions run one at a
+/// time, since the pipeline isn't documented as safe for concurrent use.
+final class SharedWhisperKit: @unchecked Sendable {
+    private let kit: WhisperKit
+    private let gate = AsyncSerialGate()
+
+    init(kit: WhisperKit) {
+        self.kit = kit
+    }
+
+    func transcribe(samples: [Float], options: DecodingOptions) async -> [[TranscriptionResult]?] {
+        await gate.enter()
+        let results = await kit.transcribe(audioArrays: [samples], decodeOptions: options)
+        await gate.leave()
+        return results
+    }
+}
+
+/// Loads each WhisperKit model once while any engine uses it, and frees it after the last
+/// engine releases it (so memory isn't held between recordings).
+actor WhisperKitCache {
+    static let shared = WhisperKitCache()
+
+    private var entries: [String: (load: Task<SharedWhisperKit, Error>, users: Int)] = [:]
+
+    func acquire(modelName: String) async throws -> SharedWhisperKit {
+        if let entry = entries[modelName] {
+            entries[modelName] = (entry.load, entry.users + 1)
+            return try await entry.load.value
+        }
+        let load = Task<SharedWhisperKit, Error> {
+            let config = modelName.isEmpty ? WhisperKitConfig() : WhisperKitConfig(model: modelName)
+            return SharedWhisperKit(kit: try await WhisperKit(config))
+        }
+        entries[modelName] = (load, 1)
+        do {
+            return try await load.value
+        } catch {
+            // Don't cache a failed load; the next recording should try again.
+            entries[modelName] = nil
+            throw error
+        }
+    }
+
+    func release(modelName: String) {
+        guard let entry = entries[modelName] else { return }
+        entries[modelName] = entry.users <= 1 ? nil : (entry.load, entry.users - 1)
+    }
+}
+
+/// Minimal async mutex: callers `enter()` in FIFO order and must `leave()`.
+actor AsyncSerialGate {
+    private var busy = false
+    private var waiters: [CheckedContinuation<Void, Never>] = []
+
+    func enter() async {
+        guard busy else {
+            busy = true
+            return
+        }
+        await withCheckedContinuation { waiters.append($0) }
+    }
+
+    func leave() {
+        if waiters.isEmpty {
+            busy = false
+        } else {
+            waiters.removeFirst().resume()
+        }
+    }
 }

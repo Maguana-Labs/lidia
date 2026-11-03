@@ -45,8 +45,8 @@ final class MeetingQueryService {
             )
             let context = buildContext(from: selected, limit: expandedSearch ? 50 : 20)
 
-            let client = makeLLMClient(settings: settings, modelManager: modelManager, taskType: .chat)
-            let model = modelOverride.flatMap({ $0.isEmpty ? nil : $0 }) ?? effectiveModel(for: .query, settings: settings, taskType: .chat)
+            let client = makeLLMClient(settings: settings, modelManager: modelManager, taskType: .ask)
+            let model = modelOverride.flatMap({ $0.isEmpty ? nil : $0 }) ?? effectiveModel(for: .query, settings: settings, taskType: .ask)
             let rawContent = try await client.chat(
                 messages: [
                     .init(role: "system", content: """
@@ -113,8 +113,8 @@ final class MeetingQueryService {
                 context += "Action Items:\n\(items.joined(separator: "\n"))\n"
             }
 
-            let client = makeLLMClient(settings: settings, modelManager: modelManager, taskType: .chat)
-            let model = effectiveModel(for: .query, settings: settings, taskType: .chat)
+            let client = makeLLMClient(settings: settings, modelManager: modelManager, taskType: .ask)
+            let model = effectiveModel(for: .query, settings: settings, taskType: .ask)
             let rawContent = try await client.chat(
                 messages: [
                     .init(role: "system", content: """
@@ -160,8 +160,8 @@ final class MeetingQueryService {
             context += "Action Items:\n\(items.joined(separator: "\n"))\n"
         }
 
-        let client = makeLLMClient(settings: settings, modelManager: modelManager, taskType: .chat)
-        let model = modelOverride.flatMap({ $0.isEmpty ? nil : $0 }) ?? effectiveModel(for: .query, settings: settings, taskType: .chat)
+        let client = makeLLMClient(settings: settings, modelManager: modelManager, taskType: .ask)
+        let model = modelOverride.flatMap({ $0.isEmpty ? nil : $0 }) ?? effectiveModel(for: .query, settings: settings, taskType: .ask)
 
         var messages: [LLMChatMessage] = [
             .init(role: "system", content: """

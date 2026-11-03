@@ -35,20 +35,25 @@ final class GraniteSpeechEngine: STTEngine, Sendable {
 
                 do {
                     Self.logger.info("Loading Granite Speech model: \(modelID)")
-                    let model = try await GraniteSpeechModel.fromPretrained(modelID)
 
                     // Audio must be 16kHz mono — check sample count implies duration
                     let duration = Double(allSamples.count) / 16000.0
                     Self.logger.info("Transcribing \(allSamples.count) samples (\(String(format: "%.1f", duration))s)")
 
-                    let audio = MLXArray(allSamples)
-                    let params = model.defaultGenerationParameters
-                    let output = model.generate(audio: audio, generationParameters: params)
+                    // MLX can't encode two evaluations at once on the GPU: share the
+                    // process-wide lock with the LLM so a summary can't collide with this.
+                    let samples = allSamples
+                    let rawText = try await MLXInferenceLock.shared.run {
+                        let model = try await GraniteSpeechModel.fromPretrained(modelID)
+                        let audio = MLXArray(samples)
+                        let params = model.defaultGenerationParameters
+                        return model.generate(audio: audio, generationParameters: params).text
+                    }
 
-                    Self.logger.info("Granite output: \(output.text.prefix(200))")
+                    Self.logger.info("Granite output: \(rawText.prefix(200))")
 
                     // Parse output text into words with estimated timing
-                    let text = output.text.trimmingCharacters(in: .whitespacesAndNewlines)
+                    let text = rawText.trimmingCharacters(in: .whitespacesAndNewlines)
                     let words = text.split(separator: " ")
                     let wordDuration = words.isEmpty ? 0 : duration / Double(words.count)
 

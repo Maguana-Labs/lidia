@@ -11,12 +11,13 @@ struct AppSettingsTests {
     // because tests in the same process share UserDefaults.standard.
 
     @MainActor
-    @Test("LLM provider defaults to Ollama")
+    @Test("LLM provider defaults to automatic on-device, never Ollama")
     func defaultLLMProvider() {
         UserDefaults.standard.removeObject(forKey: "llmProvider")
         let settings = LLMSettings()
         settings.loadFromDefaults()
-        #expect(settings.llmProvider == .ollama)
+        #expect(settings.llmProvider == .automaticLocal)
+        #expect(settings.llmProvider != .ollama)
     }
 
     @MainActor
@@ -29,12 +30,12 @@ struct AppSettingsTests {
     }
 
     @MainActor
-    @Test("OpenAI base URL defaults to api.openai.com")
+    @Test("OpenAI base URL defaults to api.openai.com/v1")
     func defaultOpenAIBaseURL() {
         UserDefaults.standard.removeObject(forKey: "openaiBaseURL")
         let settings = LLMSettings()
         settings.loadFromDefaults()
-        #expect(settings.openaiBaseURL == "https://api.openai.com")
+        #expect(settings.openaiBaseURL == "https://api.openai.com/v1")
     }
 
     @MainActor

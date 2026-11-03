@@ -3,9 +3,9 @@ import Testing
 @testable import LidIA
 
 @Test func voiceBackendSelectionPrefersRealtimeWhenOpenAIIsConfigured() {
-    #expect(VoiceAssistantBackend.resolve(ttsProvider: .openai, openAIAPIKey: "sk-test") == .openAIRealtime)
-    #expect(VoiceAssistantBackend.resolve(ttsProvider: .openai, openAIAPIKey: "") == .localPipeline)
-    #expect(VoiceAssistantBackend.resolve(ttsProvider: .system, openAIAPIKey: "sk-test") == .localPipeline)
+    #expect(VoiceAssistantBackend.resolve(ttsProvider: .openai, openAIAPIKey: "sk-test", localOnly: false) == .openAIRealtime)
+    #expect(VoiceAssistantBackend.resolve(ttsProvider: .openai, openAIAPIKey: "", localOnly: false) == .localPipeline)
+    #expect(VoiceAssistantBackend.resolve(ttsProvider: .system, openAIAPIKey: "sk-test", localOnly: false) == .localPipeline)
 }
 
 @Test func realtimeVoiceClientBuildsPCM16InputPayload() throws {
@@ -31,5 +31,5 @@ import Testing
     #expect(textEvent == .textDelta("Hi"))
 
     let transcriptEvent = try #require(RealtimeVoiceClient.parseServerEvent(from: Data("{\"type\":\"conversation.item.input_audio_transcription.completed\",\"transcript\":\"hello there\"}".utf8)))
-    #expect(transcriptEvent == .inputTranscript("hello there"))
+    #expect(transcriptEvent == .inputTranscript("hello there", isFinal: true))
 }

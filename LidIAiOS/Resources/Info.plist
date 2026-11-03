@@ -14,14 +14,50 @@
 	<string>$(MARKETING_VERSION)</string>
 	<key>CFBundleExecutable</key>
 	<string>$(EXECUTABLE_NAME)</string>
-	<key>NSMicrophoneUsageDescription</key>
-	<string>LidIA uses the microphone for voice notes and voice commands about your meetings.</string>
-	<key>NSSpeechRecognitionUsageDescription</key>
-	<string>LidIA uses speech recognition to transcribe your voice notes on-device.</string>
-	<key>CFBundleLocalizations</key>
+	<key>CFBundlePackageType</key>
+	<string>$(PRODUCT_BUNDLE_PACKAGE_TYPE)</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>LSRequiresIPhoneOS</key>
+	<true/>
+	<key>CFBundleURLTypes</key>
 	<array>
-		<string>en</string>
-		<string>es</string>
+		<dict>
+			<key>CFBundleURLName</key>
+			<string>io.lidia.ios</string>
+			<key>CFBundleURLSchemes</key>
+			<array>
+				<string>lidia</string>
+			</array>
+		</dict>
+	</array>
+	<key>NSMicrophoneUsageDescription</key>
+	<string>LidIA records your meetings so it can transcribe them on this iPhone.</string>
+	<key>NSSpeechRecognitionUsageDescription</key>
+	<string>LidIA transcribes your meetings on this iPhone. Audio isn't sent anywhere.</string>
+	<key>NSCalendarsFullAccessUsageDescription</key>
+	<string>LidIA shows your next meeting so you can record or join it in one tap, and names recordings after the event.</string>
+	<key>NSSupportsLiveActivities</key>
+	<true/>
+	<key>UIBackgroundModes</key>
+	<array>
+		<string>audio</string>
+	</array>
+	<key>UIApplicationSceneManifest</key>
+	<dict>
+		<key>UIApplicationSupportsMultipleScenes</key>
+		<false/>
+	</dict>
+	<key>UISupportedInterfaceOrientations</key>
+	<array>
+		<string>UIInterfaceOrientationPortrait</string>
+	</array>
+	<key>UISupportedInterfaceOrientations~ipad</key>
+	<array>
+		<string>UIInterfaceOrientationPortrait</string>
+		<string>UIInterfaceOrientationPortraitUpsideDown</string>
+		<string>UIInterfaceOrientationLandscapeLeft</string>
+		<string>UIInterfaceOrientationLandscapeRight</string>
 	</array>
 	<key>NSAppTransportSecurity</key>
 	<dict>

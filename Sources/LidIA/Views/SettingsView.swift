@@ -1,218 +1,233 @@
-import SwiftUI
 import SwiftData
+import SwiftUI
 
+/// The Settings window: a searchable sidebar of panes and a detail column
+/// with a large title and a centered grouped form.
 struct SettingsView: View {
     @Bindable var settings: AppSettings
+    @Bindable private var router = SettingsRouter.shared
+    @State private var ai = AISettingsModel()
+    @State private var mcp = MCPSettingsModel()
+    @State private var selectedResult: String?
+    @FocusState private var searchFocused: Bool
+
+    private var isSearching: Bool {
+        !router.searchText.trimmingCharacters(in: .whitespaces).isEmpty
+    }
 
     var body: some View {
-        TabView {
-            Form {
-                GeneralSettingsTab(settings: settings)
+        NavigationSplitView {
+            sidebar
+                .navigationSplitViewColumnWidth(min: 200, ideal: SettingsLayout.sidebarWidth, max: 280)
+                .toolbar(removing: .sidebarToggle)
+        } detail: {
+            NavigationStack(path: $router.path) {
+                paneView(router.pane)
+                    .navigationDestination(for: SettingsSubpage.self) { subpage in
+                        subpageView(subpage)
+                    }
             }
-            .formStyle(.grouped)
-            .tabItem { Label("General", systemImage: "gear") }
-
-            Form {
-                LLMSettingsTab(settings: settings)
-            }
-            .formStyle(.grouped)
-            .tabItem { Label("AI Models", systemImage: "brain") }
-
-            Form {
-                RecordingSettingsTab(settings: settings)
-            }
-            .formStyle(.grouped)
-            .tabItem { Label("Recording", systemImage: "waveform") }
-
-            Form {
-                VoiceSettingsTab(settings: settings)
-            }
-            .formStyle(.grouped)
-            .tabItem { Label("Voice", systemImage: "mic.fill") }
-
-            Form {
-                CalendarSettingsTab(settings: settings)
-            }
-            .formStyle(.grouped)
-            .tabItem { Label("Calendar", systemImage: "calendar") }
-
-            Form {
-                IntegrationSettingsTab(settings: settings)
-            }
-            .formStyle(.grouped)
-            .tabItem { Label("Integrations", systemImage: "puzzlepiece.fill") }
         }
-        .frame(minWidth: 580, idealWidth: 640, minHeight: 520, idealHeight: 600)
+        .searchable(text: $router.searchText, placement: .sidebar, prompt: "Search settings")
+        .searchFocused($searchFocused)
+        .background {
+            Button("Search Settings") { searchFocused = true }
+                .keyboardShortcut("f", modifiers: .command)
+                .frame(width: 0, height: 0)
+                .opacity(0)
+                .accessibilityHidden(true)
+        }
+        .onChange(of: router.searchText) { _, text in
+            if text.isEmpty { selectedResult = nil }
+        }
+        .frame(minWidth: 760, idealWidth: 860, minHeight: 520, idealHeight: 640)
+    }
+
+    // MARK: - Sidebar
+
+    private enum SidebarItem: Hashable {
+        case pane(SettingsPane)
+        case result(String)
+    }
+
+    private var sidebarSelection: Binding<SidebarItem?> {
+        Binding(
+            get: {
+                if isSearching { return selectedResult.map(SidebarItem.result) }
+                return .pane(router.pane)
+            },
+            set: { item in
+                switch item {
+                case .pane(let pane):
+                    router.pane = pane
+                case .result(let id):
+                    selectedResult = id
+                    if let entry = SettingsSearchIndex.entries.first(where: { $0.id == id }) {
+                        router.reveal(entry.location)
+                    }
+                case nil:
+                    break
+                }
+            }
+        )
+    }
+
+    private var sidebar: some View {
+        List(selection: sidebarSelection) {
+            if isSearching {
+                searchResults
+            } else {
+                Section {
+                    ProfileHeader(settings: settings)
+                        .selectionDisabled()
+                }
+                ForEach(Array(SettingsPane.sidebarGroups.enumerated()), id: \.offset) { _, group in
+                    Section {
+                        ForEach(group) { pane in
+                            Label {
+                                Text(pane.title)
+                            } icon: {
+                                SettingsIconTile(symbol: pane.symbol, tint: pane.tint, accessibilityName: "\(pane.title) icon")
+                            }
+                            .tag(SidebarItem.pane(pane))
+                        }
+                    }
+                }
+            }
+        }
+        .listStyle(.sidebar)
+        .onExitCommand { router.searchText = "" }
+    }
+
+    @ViewBuilder
+    private var searchResults: some View {
+        let results = SettingsSearchIndex.search(router.searchText)
+        if results.isEmpty {
+            Text("No results for \u{201C}\(router.searchText)\u{201D}")
+                .foregroundStyle(.secondary)
+                .selectionDisabled()
+        } else {
+            Section("Results") {
+                ForEach(results) { entry in
+                    HStack(spacing: 8) {
+                        SettingsIconTile(symbol: entry.pane.symbol, tint: entry.pane.tint, size: 20, accessibilityName: "\(entry.pane.title) icon")
+                        VStack(alignment: .leading, spacing: 1) {
+                            Text(entry.title)
+                                .lineLimit(1)
+                            Text(entry.breadcrumb)
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                                .lineLimit(1)
+                        }
+                    }
+                    .padding(.vertical, 1)
+                    .tag(SidebarItem.result(entry.id))
+                    .accessibilityElement(children: .combine)
+                    .accessibilityHint("Opens \(entry.breadcrumb)")
+                }
+            }
+        }
+    }
+
+    // MARK: - Detail
+
+    @ViewBuilder
+    private func paneView(_ pane: SettingsPane) -> some View {
+        switch pane {
+        case .general: GeneralPane(settings: settings)
+        case .recording: RecordingPane(settings: settings)
+        case .notes: NotesTemplatesPane(settings: settings)
+        case .ai: AIPane(settings: settings, ai: ai)
+        case .calendars: CalendarsPane(settings: settings)
+        case .notifications: NotificationsPane(settings: settings)
+        case .actionItems: ActionItemsPane(settings: settings)
+        case .voice: VoicePane(settings: settings)
+        case .dictation: DictationPane(settings: settings)
+        case .apps: AppsExtensionsPane(settings: settings, mcp: mcp)
+        case .sync: SyncPane(settings: settings)
+        case .privacy: PrivacyPane(settings: settings)
+        case .importData: ImportPane()
+        case .about: AboutPane()
+        }
+    }
+
+    @ViewBuilder
+    private func subpageView(_ subpage: SettingsSubpage) -> some View {
+        switch subpage {
+        case .vocabulary: VocabularyPage(settings: settings)
+        case .onDeviceModels: OnDeviceModelsPage(settings: settings, ai: ai)
+        case .aiAdvanced: AIAdvancedPage(settings: settings, ai: ai)
+        case .template(let id): TemplateDetailPage(settings: settings, templateID: id)
+        case .integration(let kind): IntegrationDetailPage(settings: settings, kind: kind)
+        }
     }
 }
 
-// MARK: - Template Editor (Inline)
+// MARK: - Profile header
 
-struct TemplateEditorView: View {
-    @Binding var template: MeetingTemplate
+/// Avatar, name and what the name is for. Click to edit the name.
+private struct ProfileHeader: View {
+    @Bindable var settings: AppSettings
+    @State private var isEditing = false
 
-    @State private var attendeeMin: String = ""
-    @State private var attendeeMax: String = ""
-    @State private var keywords: String = ""
-    @State private var aiDescription: String = ""
-    @State private var isGeneratingFromAI = false
+    private var name: String {
+        settings.displayName.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private var initials: String {
+        let parts = name.split(separator: " ").prefix(2)
+        let letters = parts.compactMap(\.first).map { String($0).uppercased() }
+        return letters.isEmpty ? "?" : letters.joined()
+    }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            // Name + Emoji
-            HStack(spacing: 8) {
-                TextField("Emoji", text: $template.emoji)
-                    .frame(width: 40)
-                    .multilineTextAlignment(.center)
-                TextField("Template Name", text: $template.name)
-            }
-
-            TextField("Description (shown in picker)", text: $template.description)
-                .font(.callout)
-
-            // AI-assisted creation
-            if !template.isBuiltIn {
-                VStack(alignment: .leading, spacing: 4) {
-                    Text("Describe what you want")
+        Button {
+            isEditing = true
+        } label: {
+            HStack(spacing: 10) {
+                Circle()
+                    .fill(LinearGradient(colors: [.accentColor.opacity(0.85), .accentColor], startPoint: .top, endPoint: .bottom))
+                    .frame(width: 36, height: 36)
+                    .overlay {
+                        Text(initials)
+                            .font(.system(size: 14, weight: .semibold, design: .rounded))
+                            .foregroundStyle(.white)
+                    }
+                    .accessibilityHidden(true)
+                VStack(alignment: .leading, spacing: 1) {
+                    Text(name.isEmpty ? "Add your name" : name)
+                        .font(.headline)
+                        .foregroundStyle(name.isEmpty ? .secondary : .primary)
+                        .lineLimit(1)
+                    Text("How LidIA finds your action items")
                         .font(.caption)
                         .foregroundStyle(.secondary)
-                    HStack {
-                        TextField("e.g. customer calls focusing on pain points and feature requests", text: $aiDescription)
-                        Button {
-                            generateFromDescription()
-                        } label: {
-                            if isGeneratingFromAI {
-                                ProgressView().controlSize(.small)
-                            } else {
-                                Image(systemName: "sparkles")
-                            }
-                        }
-                        .disabled(aiDescription.isEmpty || isGeneratingFromAI)
-                    }
+                        .lineLimit(2)
+                        .fixedSize(horizontal: false, vertical: true)
                 }
+                Spacer(minLength: 0)
             }
-
-            // Mode toggle
-            if !template.isBuiltIn {
-                Toggle("Advanced mode (raw prompt)", isOn: $template.isAdvancedMode)
-                    .toggleStyle(.checkbox)
-            }
-
-            if template.isAdvancedMode {
-                Text("System Prompt")
+            .padding(.vertical, 6)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel(name.isEmpty ? "Add your name" : "Your name, \(name)")
+        .accessibilityHint("Edit the name LidIA uses to find your action items.")
+        .popover(isPresented: $isEditing, arrowEdge: .trailing) {
+            VStack(alignment: .leading, spacing: 10) {
+                Text("Your name")
+                    .font(.headline)
+                TextField("Your name", text: $settings.displayName, prompt: Text("First and last name"))
+                    .textFieldStyle(.roundedBorder)
+                    .frame(width: 240)
+                    .onSubmit { isEditing = false }
+                Text("LidIA uses it to find your action items and label you in transcripts.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
-                TextEditor(text: $template.systemPrompt)
-                    .font(.body.monospaced())
-                    .frame(minHeight: 150)
-                    .border(Color.secondary.opacity(0.2))
-            } else {
-                Text("Sections")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-
-                ForEach($template.sections) { $section in
-                    HStack(spacing: 8) {
-                        TextField("Section name", text: $section.name)
-                            .frame(maxWidth: 150)
-                        TextField("Description", text: $section.description)
-                        Picker("", selection: $section.format) {
-                            Text("Bullets").tag(OutputFormat.bullets)
-                            Text("Prose").tag(OutputFormat.prose)
-                            Text("Table").tag(OutputFormat.table)
-                        }
-                        .frame(width: 100)
-                        let sectionID = section.id
-                        Button(role: .destructive) {
-                            template.sections.removeAll { $0.id == sectionID }
-                        } label: {
-                            Image(systemName: "trash")
-                        }
-                        .buttonStyle(.borderless)
-                    }
-                }
-
-                Button("Add Section") {
-                    template.sections.append(SectionSpec(name: ""))
-                }
-                .buttonStyle(.glass)
-
-                if !template.sections.isEmpty {
-                    DisclosureGroup("Preview prompt") {
-                        Text(template.effectiveSystemPrompt)
-                            .font(.caption.monospaced())
-                            .textSelection(.enabled)
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                            .padding(8)
-                            .background(.quaternary.opacity(0.3), in: RoundedRectangle(cornerRadius: 6))
-                    }
-                }
+                    .frame(width: 240, alignment: .leading)
+                    .fixedSize(horizontal: false, vertical: true)
             }
-
-            Text("Auto-Detection Rules")
-                .font(.caption)
-                .foregroundStyle(.secondary)
-
-            HStack(spacing: 8) {
-                Text("Attendees:")
-                    .frame(width: 80, alignment: .leading)
-                TextField("Min", text: $attendeeMin)
-                    .frame(width: 60)
-                    .onChange(of: attendeeMin) { _, _ in syncAttendeeRules() }
-                Text("to")
-                TextField("Max", text: $attendeeMax)
-                    .frame(width: 60)
-                    .onChange(of: attendeeMax) { _, _ in syncAttendeeRules() }
-            }
-
-            HStack(spacing: 8) {
-                Text("Keywords:")
-                    .frame(width: 80, alignment: .leading)
-                TextField("e.g. brainstorm, ideation", text: $keywords)
-                    .onChange(of: keywords) { _, _ in syncKeywords() }
-            }
-        }
-        .padding(.vertical, 4)
-        .onAppear {
-            if let range = template.autoDetectRules.attendeeCount {
-                attendeeMin = "\(range.lowerBound)"
-                attendeeMax = "\(range.upperBound)"
-            }
-            keywords = template.autoDetectRules.titleKeywords.joined(separator: ", ")
-        }
-    }
-
-    private func syncAttendeeRules() {
-        if let min = Int(attendeeMin), let max = Int(attendeeMax), min <= max {
-            template.autoDetectRules.attendeeCount = min...max
-        } else {
-            template.autoDetectRules.attendeeCount = nil
-        }
-    }
-
-    private func syncKeywords() {
-        template.autoDetectRules.titleKeywords = keywords
-            .split(separator: ",")
-            .map { $0.trimmingCharacters(in: .whitespaces) }
-            .filter { !$0.isEmpty }
-    }
-
-    private func generateFromDescription() {
-        isGeneratingFromAI = true
-        Task {
-            defer { isGeneratingFromAI = false }
-            let parts = aiDescription
-                .split(separator: ",")
-                .map { $0.trimmingCharacters(in: .whitespaces) }
-                .filter { !$0.isEmpty }
-
-            template.sections = parts.map { part in
-                SectionSpec(name: part.capitalized, description: "", format: .bullets)
-            }
-            template.isAdvancedMode = false
-            if template.name.isEmpty {
-                template.name = String(aiDescription.prefix(30))
-            }
+            .padding(16)
         }
     }
 }

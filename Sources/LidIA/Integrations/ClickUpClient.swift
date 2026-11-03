@@ -11,6 +11,7 @@ enum ClickUpClient {
         listID: String,
         apiKey: String
     ) async throws {
+        try PrivacyGate.check(.clickUp)
         guard let url = URL(string: "\(baseURL)/list/\(listID)/task") else {
             throw URLError(.badURL)
         }

@@ -6,7 +6,7 @@ struct AvatarView: View {
 
     var body: some View {
         let initials = name.split(separator: " ").prefix(2).compactMap(\.first).map(String.init).joined()
-        let colors: [Color] = [.blue, .purple, .teal, .orange, .pink, .indigo]
+        let colors = Brand.avatarPalette
         let stableHash = name.utf8.reduce(0) { ($0 &* 31) &+ Int($1) }
         let index = stableHash % colors.count
         let color = colors[index < 0 ? index + colors.count : index]

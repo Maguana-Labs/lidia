@@ -13,16 +13,6 @@ final class ProactiveScheduler {
         case off
     }
 
-    private struct MonitoredEvent: Sendable {
-        let id: String
-        let rawID: String
-        let title: String
-        let start: Date
-        let end: Date
-        let attendees: [String]
-        let meetingLink: URL?
-    }
-
     /// The next meeting that should show a join banner (has a link, starts within notification window).
     /// Observed by LidIAApp to trigger the floating banner.
     private(set) var pendingBannerMeeting: PendingMeetingBanner?
@@ -38,8 +28,11 @@ final class ProactiveScheduler {
 
     private var morningDigestTimer: Timer?
     private var eventCheckTimer: Timer?
-    private var scheduledPreps: Set<String> = []
+    /// Merged agenda event IDs that already got their single pre-meeting prompt.
+    private var promptedEvents: Set<String> = []
     private var scheduledNudges: Set<String> = []
+    /// Provides whether a recording is in progress (no prompts while recording).
+    var isRecordingProvider: (@MainActor () -> Bool)?
     private var lastMorningTriggerDay: Date?
     private var lastActionItemReminderDay: Date?
 
@@ -57,6 +50,7 @@ final class ProactiveScheduler {
         Task {
             _ = await NotificationDispatcher.requestPermission()
         }
+        NotificationDispatcher.removeLegacyCalendarNotifications()
 
         startTimers()
     }
@@ -81,7 +75,6 @@ final class ProactiveScheduler {
         morningDigestTimer = nil
         eventCheckTimer?.invalidate()
         eventCheckTimer = nil
-        scheduledPreps.removeAll()
         scheduledNudges.removeAll()
         pendingBannerMeeting = nil
     }
@@ -172,30 +165,64 @@ final class ProactiveScheduler {
         RunLoop.main.add(morningDigestTimer!, forMode: .common)
     }
 
+    /// Settings snapshot for the prompt planner.
+    static func promptConfig(from settings: AppSettings) -> PreMeetingPromptPlanner.Config {
+        PreMeetingPromptPlanner.Config(
+            notifyUpcoming: settings.notifyUpcomingMeetings,
+            notifyMinutes: settings.meetingNotificationMinutes,
+            recordPromptEnabled: settings.calendarRecordPromptEnabled,
+            prepEnabled: settings.proactivePreMeetingPrep || settings.prepNotificationsEnabled,
+            prepMinutes: settings.proactivePreMeetingMinutes
+        )
+    }
+
     private func checkEvents() {
         guard let settings else { return }
-        let events = monitoredEvents()
+        let events = agendaEvents()
         let now = Date()
         let quietHours = Self.isWithinQuietHours(
             now: now,
             quietStart: settings.proactiveQuietStart,
             quietEnd: settings.proactiveQuietEnd
         )
+        let isRecording = isRecordingProvider?() ?? false
 
-        if settings.proactivePreMeetingPrep {
-            for event in events {
-                let interval = event.start.timeIntervalSince(now)
-                guard interval >= 0,
-                      interval <= Double(settings.proactivePreMeetingMinutes * 60),
-                      !scheduledPreps.contains(event.id) else { continue }
-                scheduledPreps.insert(event.id)
-                guard !quietHours else { continue }
-                Task { await firePreMeetingPrep(for: event) }
+        // One prompt per meeting: banner for meetings with a call link,
+        // otherwise a single notification. Never both, never twice.
+        let decisions = PreMeetingPromptPlanner.due(
+            events: events,
+            now: now,
+            config: Self.promptConfig(from: settings),
+            alreadyPrompted: promptedEvents,
+            isRecording: isRecording
+        )
+        for decision in decisions {
+            promptedEvents.insert(decision.event.id)
+            guard !quietHours else { continue }
+            switch decision.kind {
+            case .banner:
+                showBanner(for: decision.event)
+            case .notification:
+                let summary = decision.includePrep ? prepSummary(for: decision.event) : nil
+                NotificationDispatcher.sendMeetingPrompt(
+                    eventID: decision.event.calendarEventID,
+                    promptKey: decision.event.id,
+                    title: decision.event.title,
+                    body: PreMeetingPromptPlanner.notificationBody(for: decision, now: now, prepSummary: summary),
+                    meetingLink: decision.event.meetingLink
+                )
             }
         }
 
+        // Retire the banner once its meeting is well under way or gone.
+        if let banner = pendingBannerMeeting,
+           isRecording || now.timeIntervalSince(banner.start) > 30 * 60
+            || dismissedBannerEvents.contains(banner.eventID) {
+            pendingBannerMeeting = nil
+        }
+
         if settings.proactivePostMeetingNudge {
-            for event in events {
+            for event in events where !event.isAllDay {
                 let interval = now.timeIntervalSince(event.end)
                 guard interval >= Double(settings.proactivePostMeetingMinutes * 60),
                       interval <= Double((settings.proactivePostMeetingMinutes + 30) * 60),
@@ -206,32 +233,24 @@ final class ProactiveScheduler {
             }
         }
 
-        // Update the pending banner meeting — find the next upcoming meeting
-        // that starts within the notification window and hasn't been dismissed.
-        if settings.notifyUpcomingMeetings {
-            let notifyWindow = Double(settings.meetingNotificationMinutes * 60)
-            let bannerCandidate = events.first { event in
-                guard !dismissedBannerEvents.contains(event.id) else { return false }
-                let interval = event.start.timeIntervalSince(now)
-                // Show banner from N min before until 30 min after start
-                return interval <= notifyWindow && interval >= -30 * 60
-            }
+        // Keep the dedupe sets from growing forever.
+        let liveIDs = Set(events.map(\.id))
+        promptedEvents.formIntersection(liveIDs)
+        scheduledNudges.formIntersection(liveIDs)
+    }
 
-            if let candidate = bannerCandidate {
-                let banner = PendingMeetingBanner(
-                    eventID: candidate.rawID,
-                    title: candidate.title,
-                    start: candidate.start,
-                    end: candidate.end,
-                    meetingLink: candidate.meetingLink,
-                    attendees: candidate.attendees
-                )
-                if pendingBannerMeeting != banner {
-                    pendingBannerMeeting = banner
-                }
-            } else if pendingBannerMeeting != nil {
-                pendingBannerMeeting = nil
-            }
+    private func showBanner(for event: AgendaEvent) {
+        let banner = PendingMeetingBanner(
+            eventID: event.calendarEventID,
+            title: event.title,
+            start: event.start,
+            end: event.end,
+            meetingLink: event.meetingLink,
+            attendees: event.attendees
+        )
+        guard !dismissedBannerEvents.contains(banner.eventID) else { return }
+        if pendingBannerMeeting != banner {
+            pendingBannerMeeting = banner
         }
     }
 
@@ -264,7 +283,7 @@ final class ProactiveScheduler {
     }
 
     private func fireMorningDigest() async {
-        let events = monitoredEvents().filter { Calendar.current.isDateInToday($0.start) }
+        let events = agendaEvents().filter { !$0.isAllDay && Calendar.current.isDateInToday($0.start) }
         let items = dueActionItems(referenceDate: .now)
         let details = events.prefix(3).map(\.title).joined(separator: ", ")
         NotificationDispatcher.sendMorningDigest(
@@ -274,20 +293,9 @@ final class ProactiveScheduler {
         )
     }
 
-    private func firePreMeetingPrep(for event: MonitoredEvent) async {
-        let summary = prepSummary(for: event)
-        guard let settings else { return }
-        NotificationDispatcher.sendPreMeetingPrep(
-            eventTitle: event.title,
-            minutesBefore: settings.proactivePreMeetingMinutes,
-            summary: summary,
-            eventID: event.rawID
-        )
-    }
-
-    private func firePostMeetingNudge(for event: MonitoredEvent) async {
+    private func firePostMeetingNudge(for event: AgendaEvent) async {
         guard shouldNudge(for: event) else { return }
-        NotificationDispatcher.sendPostMeetingNudge(eventTitle: event.title, eventID: event.rawID)
+        NotificationDispatcher.sendPostMeetingNudge(eventTitle: event.title, eventID: event.calendarEventID)
     }
 
     private func fireActionItemReminders() async {
@@ -299,42 +307,28 @@ final class ProactiveScheduler {
         )
     }
 
-    private func monitoredEvents() -> [MonitoredEvent] {
-        var events: [MonitoredEvent] = []
-
-        if let calendarMonitor, calendarMonitor.isSignedIn {
-            events.append(contentsOf: calendarMonitor.upcomingEvents.map {
-                MonitoredEvent(
-                    id: "google:\($0.id)",
-                    rawID: $0.id,
-                    title: $0.title,
-                    start: $0.start,
-                    end: $0.end,
-                    attendees: $0.attendees,
-                    meetingLink: $0.meetingLink
-                )
-            })
-        }
-
-        if let eventKitManager {
-            events.append(contentsOf: eventKitManager.todayEvents.map {
-                MonitoredEvent(
-                    id: "apple:\($0.id)",
-                    rawID: $0.id,
-                    title: $0.title,
-                    start: $0.start,
-                    end: $0.end,
-                    attendees: $0.attendees,
-                    meetingLink: $0.meetingLink
-                )
-            })
-        }
-
-        return events.sorted { $0.start < $1.start }
+    /// Apple and Google events merged into one deduplicated list.
+    private func agendaEvents() -> [AgendaEvent] {
+        let google = (calendarMonitor?.isSignedIn == true) ? (calendarMonitor?.upcomingEvents ?? []) : []
+        let apple = eventKitManager?.upcomingEvents ?? []
+        return UnifiedCalendar.merge(apple: apple, google: google)
     }
 
-    private func prepSummary(for event: MonitoredEvent) -> String {
-        let relatedMeetings = recentMeetings(matching: event)
+    private func prepSummary(for event: AgendaEvent) -> String {
+        // Earlier meetings in the same series or with the same people (not just
+        // this exact event), so recurring meetings get their history.
+        let library: [Meeting] = modelContext.flatMap {
+            try? $0.fetch(FetchDescriptor<Meeting>(sortBy: [SortDescriptor(\.date, order: .reverse)]))
+        } ?? []
+        let upcoming = MeetingHistoryMatcher.Upcoming(
+            title: event.title,
+            attendees: event.attendees,
+            calendarEventIDs: [event.googleEventID, event.appleEventID].compactMap { $0 },
+            start: event.start
+        )
+        let relatedMeetings = MeetingHistoryMatcher
+            .matches(for: upcoming, in: library.filter { $0.status == .complete })
+            .map(\.meeting)
         let relatedItems = relatedMeetings
             .flatMap(\.actionItems)
             .filter { !$0.isCompleted }
@@ -353,13 +347,13 @@ final class ProactiveScheduler {
         return fragments.isEmpty ? "Open LidIA for the latest notes and context." : fragments.joined(separator: " ")
     }
 
-    private func shouldNudge(for event: MonitoredEvent) -> Bool {
+    private func shouldNudge(for event: AgendaEvent) -> Bool {
         let relatedMeetings = recentMeetings(matching: event)
         guard let lastMeeting = relatedMeetings.first else { return true }
         return lastMeeting.status == .failed
     }
 
-    private func recentMeetings(matching event: MonitoredEvent) -> [Meeting] {
+    private func recentMeetings(matching event: AgendaEvent) -> [Meeting] {
         guard let context = modelContext else { return [] }
         let descriptor = FetchDescriptor<Meeting>(sortBy: [SortDescriptor(\.date, order: .reverse)])
         let meetings = (try? context.fetch(descriptor)) ?? []
@@ -368,7 +362,7 @@ final class ProactiveScheduler {
             guard meeting.status == .complete || meeting.status == .failed else { return false }
 
             if let calendarEventID = meeting.calendarEventID,
-               calendarEventID == event.rawID {
+               calendarEventID == event.googleEventID || calendarEventID == event.appleEventID {
                 return true
             }
 

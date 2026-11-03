@@ -13,8 +13,8 @@ Thank you for your interest in contributing! LidIA is a local-first macOS meetin
 ### Setup
 
 ```bash
-git clone https://github.com/lidia-app/LidIA.git
-cd LidIA
+git clone https://github.com/Maguana-Labs/lidia.git
+cd lidia
 ./run.sh        # Build + package .app bundle + launch
 ```
 
@@ -83,7 +83,7 @@ See [CLAUDE.md](CLAUDE.md) for detailed project structure, architecture patterns
 
 ## Reporting Issues
 
-Use [GitHub Issues](https://github.com/lidia-app/LidIA/issues) with these tags:
+Use [GitHub Issues](https://github.com/Maguana-Labs/lidia/issues) with these tags:
 - `[bug]` — Something isn't working
 - `[feat]` — Feature request
 - `[fix]` — You have a fix to propose

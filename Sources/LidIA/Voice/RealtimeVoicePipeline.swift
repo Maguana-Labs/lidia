@@ -2,8 +2,10 @@ import Foundation
 import Synchronization
 import os
 
-/// VoicePipeline using OpenAI Realtime WebSocket API (audio-in → audio-out).
-/// No tool execution — text and audio arrive together from the WebSocket (D2).
+/// VoicePipeline over a realtime speech-to-speech service (OpenAI or Grok):
+/// the user's audio goes up, the transcript comes back, meeting context found
+/// from that transcript is added to the instructions, then the spoken answer
+/// streams down. No tool execution: text and audio arrive together (D2).
 /// @unchecked Sendable is safe: `client` and `voice` are immutable,
 /// `currentTask` is protected by a Mutex.
 final class RealtimeVoicePipeline: VoicePipeline, @unchecked Sendable {
@@ -13,9 +15,9 @@ final class RealtimeVoicePipeline: VoicePipeline, @unchecked Sendable {
     private let voice: String
     private let currentTaskMutex = Mutex<Task<Void, Never>?>(nil)
 
-    init(apiKey: String, voice: String = "nova") {
-        self.client = RealtimeVoiceClient(apiKey: apiKey)
-        self.voice = voice
+    init(apiKey: String, provider: RealtimeVoiceProvider = .openAI, voice: String = "marin") {
+        self.client = RealtimeVoiceClient(apiKey: apiKey, provider: provider)
+        self.voice = provider.voice(for: voice)
     }
 
     func process(turn: VoiceTurnInput) -> AsyncStream<VoicePipelineEvent> {
@@ -33,17 +35,20 @@ final class RealtimeVoicePipeline: VoicePipeline, @unchecked Sendable {
 
                     try Task.checkCancellation()
 
-                    // 2. Generate response (text + audio together)
+                    // 2. Meeting context for what was asked (same as the local pipeline).
+                    let enriched = transcript.isEmpty ? "" : await turn.contextProvider(transcript)
+
+                    // 3. Generate response (text + audio together)
                     let result = try await client.generateResponse(
                         for: transcript,
                         voice: voice,
-                        instructions: turn.baseSystemPrompt
+                        instructions: enriched.isEmpty ? turn.baseSystemPrompt : enriched
                     )
 
-                    // 3. Yield response text (no tool stripping — D2)
+                    // 4. Yield response text (no tool stripping — D2)
                     continuation.yield(.responseComplete(result.text))
 
-                    // 4. Yield audio if available
+                    // 5. Yield audio if available
                     if let wavData = result.wavAudioData {
                         continuation.yield(.audioReady(wavData))
                     }
@@ -68,7 +73,7 @@ final class RealtimeVoicePipeline: VoicePipeline, @unchecked Sendable {
     }
 
     func warmup() async {
-        // No-op: OpenAI Realtime doesn't need local model pre-loading.
+        // No-op: realtime services don't need local model pre-loading.
     }
 
     func cancel() {

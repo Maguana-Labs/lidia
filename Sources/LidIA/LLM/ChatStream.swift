@@ -37,6 +37,14 @@ struct ChatBarMessage: Identifiable, Codable, Sendable, Equatable {
     let sourceMeetings: [String]
     let groundingConfidence: GroundingConfidence?
     let modelLabel: String?
+    /// What the agent sent for this answer ("View what was sent"). Kept for
+    /// this session only; not persisted with the thread.
+    var agentTranscript: AgentTranscript?
+    /// Changes the agent prepared that wait for the user's confirmation.
+    var pendingActions: [AgentPendingAction] = []
+    /// The live run behind this answer (steps, reasoning, sources, follow-ups,
+    /// approvals). This session only.
+    var agentRun: AgentRun?
 
     enum Role: String, Codable, Sendable {
         case user
@@ -77,6 +85,36 @@ struct ChatBarMessage: Identifiable, Codable, Sendable, Equatable {
     }
 }
 
+// MARK: - System Prompt
+
+/// The chat's system prompt. LidIA is a general assistant first: it answers
+/// small talk and general questions from its own knowledge, and grounds
+/// answers about the user's meetings in `context`.
+enum LidIAChatPrompt {
+    static func system(context: String, personalization: String = "", date: Date = Date()) -> String {
+        let dateString = ISO8601DateFormatter.string(from: date, timeZone: .current, formatOptions: [.withFullDate])
+        let trimmedContext = context.trimmingCharacters(in: .whitespacesAndNewlines)
+        let contextSection = trimmedContext.isEmpty
+            ? "No meeting context matched this message."
+            : trimmedContext
+        return """
+            You are LidIA, the user's assistant inside a meeting notes app. Today is \(dateString).
+            \(personalization)
+            You can talk about anything. Greetings, general questions, writing help and brainstorming get a normal, friendly answer from your own knowledge.
+            When the user asks about their meetings, people, decisions or action items, answer from the meeting context below and name the meetings you used. If the context doesn't cover it, say so in one sentence and never invent meeting details.
+            When the user asks about "my" action items, match items assigned to the user (their name in the assignee field, or items without an assignee from meetings they attended).
+
+            Meeting context:
+            \(contextSection)
+
+            Response style:
+            - Be concise. 1-3 sentences for simple requests. No filler, no preamble.
+            - For action requests (create, complete, edit, delete), confirm briefly and stop.
+            - Never use emojis. Never output XML tags or JSON tool calls.
+            """
+    }
+}
+
 // MARK: - ChatStream Protocol
 
 @MainActor
@@ -114,26 +152,8 @@ final class HTTPChatStream: ChatStream {
         // Build messages array
         var messages: [LLMChatMessage] = []
 
-        // System prompt with meeting context and date
-        let dateString = ISO8601DateFormatter.string(from: Date(), timeZone: .current, formatOptions: [.withFullDate])
         let personalization = VoiceToolExecutor.personalizationPrompt(settings: settings)
-        let systemPrompt = """
-            You are LidIA, an intelligent meeting assistant. Today is \(dateString).
-            \(personalization)
-            When the user asks about "my" action items, tasks, or responsibilities, match against action items assigned to the user (look for their name in the assignee field, or items without an explicit assignee from meetings they attended).
-
-            Use the following meeting context to answer the user's question:
-
-            \(context)
-
-            Response style:
-            - Be concise. 1-3 sentences for simple requests. No filler, no preamble.
-            - For action requests (create, complete, edit, delete), confirm briefly and stop. Do NOT elaborate, explain why it's a good idea, or ask follow-up questions unless truly ambiguous.
-            - For questions, answer directly. Reference specific meeting titles when possible.
-            - Never use emojis. Never output XML tags or JSON tool calls.
-            - Base answers only on the provided meeting context.
-            - If the context is insufficient, start your response with "Insufficient evidence:".
-            """
+        let systemPrompt = LidIAChatPrompt.system(context: context, personalization: personalization)
         messages.append(LLMChatMessage(role: "system", content: systemPrompt))
 
         // Prepend file attachment content as user messages
@@ -156,7 +176,7 @@ final class HTTPChatStream: ChatStream {
 
         return AsyncStream { continuation in
             Task { @MainActor in
-                let primaryClient = makeLLMClient(settings: capturedSettings, modelManager: capturedModelManager)
+                let primaryClient = makeLLMClient(settings: capturedSettings, modelManager: capturedModelManager, taskType: .ask)
                 do {
                     for try await token in await primaryClient.chatStream(messages: capturedMessages, model: model) {
                         continuation.yield(token)
@@ -165,9 +185,24 @@ final class HTTPChatStream: ChatStream {
                     return
                 } catch {
                     // Attempt fallback if configured
-                    guard let fallbackProviderEnum = AppSettings.LLMProvider(rawValue: capturedSettings.fallbackProvider),
-                          fallbackProviderEnum != capturedSettings.llmProvider,
-                          let fallbackClient = makeClientForProvider(fallbackProviderEnum, settings: capturedSettings, modelManager: capturedModelManager) else {
+                    guard let fallbackProviderEnum = AppSettings.LLMProvider(storedValue: capturedSettings.fallbackProvider),
+                          fallbackProviderEnum != capturedSettings.llmProvider else {
+                        continuation.yield("[Error: \(error.localizedDescription)]")
+                        continuation.finish()
+                        return
+                    }
+                    // Never move a local chat to the cloud without permission.
+                    if case .block(let blockError) = fallbackDecision(
+                        from: capturedSettings.llmProvider,
+                        to: fallbackProviderEnum,
+                        settings: capturedSettings
+                    ) {
+                        let shown = blockError?.localizedDescription ?? error.localizedDescription
+                        continuation.yield("[Error: \(shown)]")
+                        continuation.finish()
+                        return
+                    }
+                    guard let fallbackClient = makeGatedClient(for: fallbackProviderEnum, settings: capturedSettings, modelManager: capturedModelManager) else {
                         continuation.yield("[Error: \(error.localizedDescription)]")
                         continuation.finish()
                         return

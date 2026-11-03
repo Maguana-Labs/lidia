@@ -1,356 +1,477 @@
+import Combine
 import SwiftUI
 import SwiftData
 
-// MARK: - Shared Helpers
-
-private func timeUntil(_ date: Date) -> String {
-    let interval = date.timeIntervalSinceNow
-    if interval < 0 { return "Now" }
-    let minutes = Int(interval / 60)
-    if minutes < 1 { return "Now" }
-    if minutes < 60 { return "in \(minutes) min" }
-    let hours = minutes / 60
-    return "in \(hours)h \(minutes % 60)m"
-}
-
+/// The menu bar panel. One job per state:
+/// - idle: start recording, see what's next, ask your meetings;
+/// - recording: see that it's working (time, level, the last line said) and pause,
+///   stop or open the notes, laid out like a Live Activity's expanded view.
+/// Sized to its content like a system menu bar extra; Settings, updates and
+/// Quit live in the footer and in the status item's right-click menu.
 struct MenuBarView: View {
+    let feed: RecordingActivityFeed
+    let close: () -> Void
+
     @Environment(RecordingSession.self) private var session
     @Environment(EventKitManager.self) private var eventKitManager
     @Environment(GoogleCalendarMonitor.self) private var googleCalendarMonitor
     @Environment(MeetingDetector.self) private var meetingDetector
     @Environment(AppSettings.self) private var settings
+    @Environment(ModelManager.self) private var modelManager
     @Environment(UpdateController.self) private var updateController
     @Environment(\.modelContext) private var modelContext
     @Query(sort: \Meeting.date, order: .reverse) private var allMeetings: [Meeting]
 
-    private var recentMeetings: [Meeting] {
-        allMeetings.filter { $0.status == .complete }
+    private var agenda: [AgendaEvent] {
+        AgendaSource.events(eventKitManager: eventKitManager, googleCalendarMonitor: googleCalendarMonitor)
     }
 
-    private var openActionItems: [(item: ActionItem, meetingTitle: String)] {
-        recentMeetings.prefix(10).flatMap { meeting in
-            meeting.actionItems
-                .filter { !$0.isCompleted }
-                .map { (item: $0, meetingTitle: meeting.title) }
-        }
+    private var calendarConnected: Bool {
+        settings.calendarEnabled || (googleCalendarMonitor.isSignedIn && settings.googleCalendarEnabled)
+    }
+
+    private var attentionCount: Int {
+        MeetingListModel.attentionItems(allMeetings).count
     }
 
     var body: some View {
-        VStack(spacing: 0) {
-            headerSection
-
-            Divider()
-
-            ScrollView {
-                VStack(alignment: .leading, spacing: 16) {
-                    if session.isRecording {
-                        recordingSection
-                    }
-
-                    if hasUpcomingEvents {
-                        comingUpSection
-                    }
-
-                    quickActionsSection
-
-                    if !openActionItems.isEmpty {
-                        actionItemsSection
-                    }
+        TimelineView(.periodic(from: .now, by: 30)) { context in
+            VStack(alignment: .leading, spacing: 0) {
+                if session.isRecording {
+                    RecordingSection(feed: feed, close: close)
+                } else {
+                    idleContent(now: context.date)
                 }
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .padding()
+                MenuDivider()
+                footer
             }
+            .padding(.vertical, 6)
+            .frame(width: 320)
+            .glassEffect(.regular, in: .rect(cornerRadius: 16))
+        }
+    }
 
-            Divider()
+    // MARK: - Idle
 
-            Button("Check for Updates...") {
-                updateController.checkForUpdates()
+    @ViewBuilder
+    private func idleContent(now: Date) -> some View {
+        let lead = UnifiedCalendar.nowCandidate(agenda, now: now)
+        let later = UnifiedCalendar.remainingToday(agenda, now: now)
+            .filter { $0.id != lead?.id && !$0.isAllDay }
+            .prefix(3)
+
+        StartRecordingCard(subtitle: captureSubtitle) {
+            startAdHoc()
+        }
+        .padding(.horizontal, 8)
+        .padding(.top, 2)
+        .padding(.bottom, 8)
+
+        if let lead {
+            MenuDivider()
+            MenuSectionHeader(
+                lead.isHappening(at: now) ? "Now" : "Up Next",
+                trailing: Self.relative(lead, now: now)
+            )
+            LeadEventRow(event: lead) { join in
+                record(lead, join: join)
             }
-            .buttonStyle(.plain)
-            .font(.caption)
-            .foregroundStyle(.secondary)
-            .padding(.horizontal, 12)
-            .padding(.vertical, 4)
+        }
 
-            Button {
-                NSApplication.shared.terminate(nil)
-            } label: {
-                HStack {
-                    Text("Quit LidIA")
+        if !later.isEmpty {
+            MenuDivider()
+            MenuSectionHeader("Later Today")
+            ForEach(Array(later)) { event in
+                LaterEventRow(event: event) {
+                    record(event, join: event.meetingLink != nil)
+                }
+            }
+        }
+
+        if !calendarConnected {
+            MenuDivider()
+            MenuRow(title: "Connect a Calendar…", systemImage: "calendar.badge.plus", tint: .secondary) {
+                close()
+                MenuBarActions.openSettings(.calendars)
+            }
+        }
+
+        if attentionCount > 0 {
+            MenuDivider()
+            MenuRow(
+                title: attentionCount == 1 ? "1 meeting needs attention" : "\(attentionCount) meetings need attention",
+                systemImage: "exclamationmark.circle.fill",
+                tint: .orange
+            ) {
+                close()
+                MenuBarActions.openMainWindow(post: .lidiaOpenHomeWorkspace)
+            }
+        }
+    }
+
+    private var captureSubtitle: String { "Microphone and system audio" }
+
+    // MARK: - Footer
+
+    private var footer: some View {
+        VStack(spacing: 0) {
+            MenuRow(title: "Ask LidIA…", systemImage: "sparkles", shortcut: "⌘K") {
+                close()
+                MenuBarActions.openMainWindow(post: .lidiaOpenAsk)
+            }
+            MenuRow(title: "New Note", systemImage: "square.and.pencil", shortcut: "⇧⌘N") {
+                close()
+                MenuBarActions.openMainWindow(post: .lidiaCreateNote)
+            }
+            MenuRow(title: "Open LidIA", systemImage: "macwindow") {
+                close()
+                MenuBarActions.openMainWindow(post: .lidiaOpenHomeWorkspace)
+            }
+            MenuDivider()
+            HStack(spacing: 2) {
+                FooterIconButton(systemImage: "gearshape", help: "Settings…") {
+                    close()
+                    MenuBarActions.openSettings()
+                }
+                Spacer()
+                Menu {
+                    Button("Check for Updates…") { updateController.checkForUpdates() }
+                        .disabled(!updateController.canCheckForUpdates)
+                    Divider()
+                    Button("Quit LidIA") { NSApplication.shared.terminate(nil) }
+                } label: {
+                    Image(systemName: "ellipsis.circle")
+                }
+                .menuStyle(.borderlessButton)
+                .menuIndicator(.hidden)
+                .fixedSize()
+                .foregroundStyle(.secondary)
+                .help("More")
+                .padding(.horizontal, 8)
+            }
+            .padding(.horizontal, 6)
+            .padding(.top, 2)
+        }
+    }
+
+    // MARK: - Actions
+
+    private func startAdHoc() {
+        guard !session.isRecording else { return }
+        _ = session.startRecording(
+            modelContext: modelContext,
+            settings: settings,
+            modelManager: modelManager,
+            meetingDetector: meetingDetector,
+            eventKitManager: eventKitManager,
+            googleCalendarMonitor: googleCalendarMonitor
+        )
+    }
+
+    private func record(_ event: AgendaEvent, join: Bool) {
+        guard !session.isRecording else { return }
+        session.startRecording(
+            from: event,
+            join: join,
+            modelContext: modelContext,
+            settings: settings,
+            modelManager: modelManager,
+            meetingDetector: meetingDetector
+        )
+    }
+
+    /// "in 3 h 28 min", "in 5 min", "ends in 20 min".
+    static func relative(_ event: AgendaEvent, now: Date) -> String {
+        if event.isHappening(at: now) {
+            let left = max(1, Int(event.end.timeIntervalSince(now) / 60))
+            return "ends in \(Self.duration(minutes: left))"
+        }
+        let minutes = max(1, Int((event.start.timeIntervalSince(now) / 60).rounded(.up)))
+        return "in \(Self.duration(minutes: minutes))"
+    }
+
+    static func duration(minutes: Int) -> String {
+        minutes >= 60
+            ? (minutes % 60 == 0 ? "\(minutes / 60) h" : "\(minutes / 60) h \(minutes % 60) min")
+            : "\(minutes) min"
+    }
+}
+
+// MARK: - Recording
+
+/// The recording, laid out like a Live Activity's expanded view, from the menu bar's
+/// `RecordingActivityFeed` (the same state the status item's timer reads).
+private struct RecordingSection: View {
+    let feed: RecordingActivityFeed
+    let close: () -> Void
+
+    @Environment(RecordingSession.self) private var session
+    @Environment(EventKitManager.self) private var eventKitManager
+    @Environment(AppSettings.self) private var settings
+    @Environment(\.modelContext) private var modelContext
+
+    var body: some View {
+        if let state = feed.state {
+            RecordingActivityExpandedView(
+                state: state,
+                level: { session.currentRMS },
+                actions: actions
+            )
+        } else {
+            // The first tick hasn't run yet.
+            Color.clear
+                .frame(height: 1)
+                .onAppear { feed.refresh(from: session) }
+        }
+    }
+
+    private var actions: RecordingActivityActions {
+        RecordingActivityActions(
+            togglePause: {
+                session.isPaused ? session.resumeRecording() : session.pauseRecording()
+                feed.refresh(from: session)
+            },
+            stop: {
+                session.stopRecording(modelContext: modelContext, settings: settings, eventKitManager: eventKitManager)
+            },
+            openNotes: session.currentMeeting.map { meeting in
+                {
+                    close()
+                    MenuBarActions.openMainWindow()
+                    NotificationCenter.default.post(
+                        name: .lidiaOpenMeeting,
+                        object: nil,
+                        userInfo: [NotificationDispatcher.eventIDUserInfoKey: meeting.id.uuidString]
+                    )
+                }
+            }
+        )
+    }
+}
+
+// MARK: - Building blocks
+
+private struct StartRecordingCard: View {
+    let subtitle: String
+    let action: () -> Void
+    @State private var hovering = false
+
+    var body: some View {
+        Button(action: action) {
+            HStack(spacing: 12) {
+                ZStack {
+                    Circle().fill(Brand.red)
+                    Circle().fill(.white).frame(width: 10, height: 10)
+                }
+                .frame(width: 30, height: 30)
+                .shadow(color: Brand.red.opacity(0.35), radius: hovering ? 6 : 3, y: 1)
+
+                VStack(alignment: .leading, spacing: 1) {
+                    Text("Start Recording")
+                        .font(.system(size: 13, weight: .semibold))
+                    Text(subtitle)
                         .font(.caption)
-                    Spacer()
-                    Text("⌘Q")
-                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
+                Spacer(minLength: 0)
+            }
+            .padding(.horizontal, 10)
+            .padding(.vertical, 9)
+            .background(
+                RoundedRectangle(cornerRadius: 10, style: .continuous)
+                    .fill(Color.primary.opacity(hovering ? 0.09 : 0.05))
+            )
+            .contentShape(.rect(cornerRadius: 10))
+        }
+        .buttonStyle(.plain)
+        .onHover { hovering = $0 }
+        .help("Record a meeting that isn't on your calendar")
+    }
+}
+
+private struct LeadEventRow: View {
+    let event: AgendaEvent
+    let onRecord: (_ join: Bool) -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(alignment: .top, spacing: 10) {
+                RoundedRectangle(cornerRadius: 1.5)
+                    .fill(Color.fromHex(event.colorHex) ?? .accentColor)
+                    .frame(width: 3)
+                    .accessibilityHidden(true)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(event.title.isEmpty ? "Untitled Event" : event.title)
+                        .font(.system(size: 13, weight: .semibold))
+                        .lineLimit(2)
+                    Text(detail)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                }
+                Spacer(minLength: 0)
+            }
+            .fixedSize(horizontal: false, vertical: true)
+
+            HStack(spacing: 8) {
+                if event.meetingLink != nil {
+                    Button { onRecord(true) } label: {
+                        Label("Join & Record", systemImage: "video.fill")
+                            .frame(maxWidth: .infinity)
+                    }
+                    .buttonStyle(.glassProminent)
+                    .help("Open the call and start recording")
+                }
+                Button { onRecord(false) } label: {
+                    Label("Record", systemImage: "record.circle")
+                        .frame(maxWidth: event.meetingLink == nil ? .infinity : nil)
+                }
+                .buttonStyle(.glass)
+                .help("Start recording this meeting")
+            }
+            .controlSize(.regular)
+        }
+        .padding(.horizontal, 16)
+        .padding(.bottom, 10)
+    }
+
+    private var detail: String {
+        let time = "\(event.start.formatted(date: .omitted, time: .shortened)) – \(event.end.formatted(date: .omitted, time: .shortened))"
+        let people = event.attendees.count
+        return people > 1 ? "\(time) · \(people) people" : time
+    }
+}
+
+private struct LaterEventRow: View {
+    let event: AgendaEvent
+    let onRecord: () -> Void
+    @State private var hovering = false
+
+    var body: some View {
+        HStack(spacing: 10) {
+            Text(event.start.formatted(date: .omitted, time: .shortened))
+                .font(.system(size: 12).monospacedDigit())
+                .foregroundStyle(.secondary)
+                .frame(width: 58, alignment: .leading)
+            Text(event.title.isEmpty ? "Untitled Event" : event.title)
+                .font(.system(size: 13))
+                .lineLimit(1)
+            Spacer(minLength: 4)
+            if hovering {
+                Button(action: onRecord) {
+                    Image(systemName: event.meetingLink != nil ? "video.circle" : "record.circle")
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(.secondary)
+                .help(event.meetingLink != nil ? "Join & Record" : "Record")
+            }
+        }
+        .padding(.horizontal, 10)
+        .frame(height: 26)
+        .background(
+            RoundedRectangle(cornerRadius: 6, style: .continuous)
+                .fill(Color.primary.opacity(hovering ? 0.07 : 0))
+        )
+        .padding(.horizontal, 6)
+        .contentShape(.rect)
+        .onHover { hovering = $0 }
+        .accessibilityElement(children: .combine)
+    }
+}
+
+private struct MenuSectionHeader: View {
+    let title: String
+    var trailing: String?
+
+    init(_ title: String, trailing: String? = nil) {
+        self.title = title
+        self.trailing = trailing
+    }
+
+    var body: some View {
+        HStack(alignment: .firstTextBaseline) {
+            Text(title)
+                .font(.system(size: 11, weight: .semibold))
+                .foregroundStyle(.secondary)
+            Spacer()
+            if let trailing {
+                Text(trailing)
+                    .font(.system(size: 11).monospacedDigit())
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .padding(.horizontal, 16)
+        .padding(.top, 8)
+        .padding(.bottom, 6)
+    }
+}
+
+/// A full-width row with the system menu's hover highlight.
+private struct MenuRow: View {
+    let title: String
+    let systemImage: String
+    var shortcut: String?
+    var tint: Color = .primary
+    let action: () -> Void
+    @State private var hovering = false
+
+    var body: some View {
+        Button(action: action) {
+            HStack(spacing: 8) {
+                Image(systemName: systemImage)
+                    .frame(width: 18)
+                    .foregroundStyle(tint == .primary ? Color.secondary : tint)
+                Text(title)
+                    .foregroundStyle(tint == .orange ? tint : .primary)
+                Spacer()
+                if let shortcut {
+                    Text(shortcut)
                         .foregroundStyle(.tertiary)
                 }
             }
-            .buttonStyle(.plain)
-            .padding(.horizontal, 12)
-            .padding(.vertical, 6)
+            .font(.system(size: 13))
+            .padding(.horizontal, 10)
+            .frame(height: 26)
+            .background(
+                RoundedRectangle(cornerRadius: 6, style: .continuous)
+                    .fill(Color.primary.opacity(hovering ? 0.08 : 0))
+            )
+            .contentShape(.rect)
         }
-        .frame(width: 320, height: 480)
+        .buttonStyle(.plain)
+        .padding(.horizontal, 6)
+        .onHover { hovering = $0 }
     }
+}
 
-    // MARK: - Sections
+private struct FooterIconButton: View {
+    let systemImage: String
+    let help: String
+    let action: () -> Void
+    @State private var hovering = false
 
-    private var headerSection: some View {
-        HStack {
-            Image(systemName: "ear.and.waveform")
-                .font(.title2)
-                .foregroundStyle(Color.accentColor)
-            Text("LidIA")
-                .font(.headline)
-            Spacer()
-            if openActionItems.count > 0 {
-                Text("\(openActionItems.count) open")
-                    .font(.caption)
-                    .padding(.horizontal, 8)
-                    .padding(.vertical, 2)
-                    .glassEffect(.regular.tint(.orange), in: .capsule)
-            }
-        }
-        .padding()
-    }
-
-    private var recordingSection: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            Label("Recording", systemImage: "record.circle.fill")
-                .font(.caption.bold())
-                .foregroundStyle(.red)
-
-            HStack {
-                Text(session.currentMeeting?.title ?? "Untitled")
-                    .font(.subheadline)
-                Spacer()
-                Text(formatElapsed(session.elapsedTime))
-                    .font(.caption.monospacedDigit())
-                    .foregroundStyle(.secondary)
-            }
-
-            Button("Stop Recording") {
-                session.stopRecording(modelContext: modelContext, settings: settings)
-            }
-            .buttonStyle(.glassProminent)
-            .tint(.red)
-            .controlSize(.small)
-        }
-        .padding()
-        .glassEffect(.regular.tint(.red.opacity(0.1)), in: .rect(cornerRadius: 8))
-    }
-
-    private var hasUpcomingEvents: Bool {
-        if googleCalendarMonitor.isSignedIn && !googleCalendarMonitor.upcomingEvents.isEmpty {
-            return true
-        }
-        return !eventKitManager.upcomingEvents.isEmpty
-    }
-
-    private var comingUpSection: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            Text("Coming Up")
-                .font(.caption.bold())
-                .foregroundStyle(.secondary)
-
-            if googleCalendarMonitor.isSignedIn && !googleCalendarMonitor.upcomingEvents.isEmpty {
-                ForEach(googleCalendarMonitor.upcomingEvents.prefix(3)) { event in
-                    MenuBarGoogleEventRow(event: event) {
-                        joinAndRecord(googleEvent: event)
-                    } onRecord: {
-                        startRecordingFromGoogleEvent(event)
-                    }
-                }
-            } else {
-                ForEach(eventKitManager.upcomingEvents.prefix(3)) { event in
-                    MenuBarEventRow(event: event) {
-                        startRecordingFromEvent(event)
-                    }
-                }
-            }
-        }
-    }
-
-    private var quickActionsSection: some View {
-        HStack(spacing: 12) {
-            Button {
-                startQuickNote()
-            } label: {
-                Label("Quick Note", systemImage: "mic.fill")
-            }
-            .buttonStyle(.glass)
-            .controlSize(.small)
-            .disabled(session.isRecording)
-        }
-        .frame(maxWidth: .infinity, alignment: .leading)
-    }
-
-    private var actionItemsSection: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            Text("Action Items")
-                .font(.caption.bold())
-                .foregroundStyle(.secondary)
-
-            ForEach(openActionItems.prefix(8), id: \.item.id) { entry in
-                MenuBarActionItemRow(
-                    item: entry.item,
-                    meetingTitle: entry.meetingTitle
+    var body: some View {
+        Button(action: action) {
+            Image(systemName: systemImage)
+                .frame(width: 26, height: 24)
+                .background(
+                    RoundedRectangle(cornerRadius: 6, style: .continuous)
+                        .fill(Color.primary.opacity(hovering ? 0.08 : 0))
                 )
-            }
+                .contentShape(.rect)
         }
-    }
-
-    // MARK: - Helpers
-
-    @discardableResult
-    private func startQuickNote() -> Meeting {
-        session.startRecording(modelContext: modelContext, settings: settings, meetingDetector: meetingDetector)
-    }
-
-    private func startRecordingFromEvent(_ event: EventKitManager.CalendarEvent) {
-        session.startRecordingFromEvent(event, modelContext: modelContext, settings: settings, meetingDetector: meetingDetector)
-    }
-
-    private func startRecordingFromGoogleEvent(_ event: GoogleCalendarClient.CalendarEvent) {
-        session.startRecordingFromGoogleEvent(event, modelContext: modelContext, settings: settings, meetingDetector: meetingDetector)
-    }
-
-    private func joinAndRecord(googleEvent event: GoogleCalendarClient.CalendarEvent) {
-        if let link = event.meetingLink {
-            NSWorkspace.shared.open(link)
-        }
-        startRecordingFromGoogleEvent(event)
-    }
-
-    private func formatElapsed(_ time: TimeInterval) -> String {
-        let minutes = Int(time) / 60
-        let seconds = Int(time) % 60
-        return String(format: "%d:%02d", minutes, seconds)
+        .buttonStyle(.plain)
+        .foregroundStyle(.secondary)
+        .onHover { hovering = $0 }
+        .help(help)
+        .accessibilityLabel(help)
     }
 }
 
-// MARK: - Row Views
-
-struct MenuBarEventRow: View {
-    let event: EventKitManager.CalendarEvent
-    let onRecord: () -> Void
-
+private struct MenuDivider: View {
     var body: some View {
-        HStack {
-            VStack(alignment: .leading, spacing: 2) {
-                Text(event.title)
-                    .font(.subheadline)
-                    .lineLimit(1)
-                HStack(spacing: 4) {
-                    Text(timeUntil(event.start))
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                    if event.meetingLink != nil {
-                        Text("·")
-                            .font(.caption)
-                            .foregroundStyle(.tertiary)
-                    }
-                }
-            }
-            Spacer()
-
-            if let link = event.meetingLink {
-                Button {
-                    NSWorkspace.shared.open(link)
-                } label: {
-                    Image(systemName: "video.fill")
-                        .font(.caption)
-                }
-                .buttonStyle(.glass)
-                .controlSize(.mini)
-                .help("Join Meeting")
-            }
-
-            Button {
-                onRecord()
-            } label: {
-                Image(systemName: "mic.fill")
-                    .font(.caption)
-            }
-            .buttonStyle(.bordered)
-            .controlSize(.mini)
-            .help("Record")
-        }
-        .padding(.vertical, 4)
-    }
-}
-
-struct MenuBarGoogleEventRow: View {
-    let event: GoogleCalendarClient.CalendarEvent
-    let onJoinAndRecord: () -> Void
-    let onRecord: () -> Void
-
-    var body: some View {
-        HStack {
-            VStack(alignment: .leading, spacing: 2) {
-                Text(event.title)
-                    .font(.subheadline)
-                    .lineLimit(1)
-                HStack(spacing: 4) {
-                    Text(timeUntil(event.start))
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
-            }
-            Spacer()
-
-            if event.meetingLink != nil {
-                Button {
-                    onJoinAndRecord()
-                } label: {
-                    Label("Join", systemImage: "video.fill")
-                        .font(.caption)
-                }
-                .buttonStyle(.glass)
-                .controlSize(.mini)
-                .help("Join + Record")
-            }
-
-            Button {
-                onRecord()
-            } label: {
-                Image(systemName: "mic.fill")
-                    .font(.caption)
-            }
-            .buttonStyle(.bordered)
-            .controlSize(.mini)
-            .help("Record")
-        }
-        .padding(.vertical, 4)
-    }
-}
-
-struct MenuBarActionItemRow: View {
-    @Bindable var item: ActionItem
-    let meetingTitle: String
-
-    var body: some View {
-        HStack(alignment: .top, spacing: 8) {
-            Button {
-                item.isCompleted.toggle()
-            } label: {
-                Image(systemName: item.isCompleted ? "checkmark.circle.fill" : "circle")
-                    .foregroundStyle(item.isCompleted ? .green : .secondary)
-                    .font(.body)
-            }
-            .buttonStyle(.plain)
-
-            VStack(alignment: .leading, spacing: 2) {
-                Text(item.title)
-                    .font(.subheadline)
-                    .lineLimit(2)
-                    .strikethrough(item.isCompleted)
-                    .foregroundStyle(item.isCompleted ? .secondary : .primary)
-
-                Text(meetingTitle)
-                    .font(.caption2)
-                    .foregroundStyle(.tertiary)
-                    .lineLimit(1)
-            }
-        }
-        .padding(.vertical, 2)
+        Divider()
+            .padding(.horizontal, 16)
+            .padding(.vertical, 4)
     }
 }

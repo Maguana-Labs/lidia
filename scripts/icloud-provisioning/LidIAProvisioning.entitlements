@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- The capabilities LidIA.app needs in its provisioning profile. Xcode's automatic
+         signing turns these on for the io.lidia.app App ID and puts them in the profile. -->
+    <key>com.apple.developer.icloud-services</key>
+    <array>
+        <string>CloudKit</string>
+    </array>
+    <key>com.apple.developer.icloud-container-identifiers</key>
+    <array>
+        <string>iCloud.io.lidia.app</string>
+    </array>
+    <key>com.apple.developer.aps-environment</key>
+    <string>development</string>
+</dict>
+</plist>
